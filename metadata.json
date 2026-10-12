@@ -1,0 +1,6 @@
+{
+  "name": "Trap Nation Visualizer Studio",
+  "description": "Professional Web Audio reactive music visualizer with circular waveform, reactive particles, glow effects, customizable themes, and 4K/Full HD video export.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
