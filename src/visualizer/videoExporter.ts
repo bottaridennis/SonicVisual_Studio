@@ -1,334 +1,283 @@
-import { ExportSettings, ExportProgress, VisualizerConfig } from '../types/visualizer';
+import { ExportSettings, ExportProgress, VisualizerConfig, RESOLUTION_SIZES } from '../types/visualizer';
 import { VisualizerRenderer } from './renderer';
 import { audioEngine } from '../audio/audioEngine';
+import { BandAnalyzer, configureAnalyser } from '../audio/analysis';
 
-export interface SupportedFormatInfo {
-  format: 'mp4' | 'webm';
-  mimeType: string;
-  isNativelySupported: boolean;
-}
-
-export function detectSupportedVideoFormats(): {
+export interface FormatSupport {
   mp4Supported: boolean;
   bestMp4Mime: string | null;
-  bestWebmMime: string;
-} {
-  const mp4Types = [
-    'video/mp4;codecs=avc1.4d401f,mp4a.40.2',
-    'video/mp4;codecs=avc1',
-    'video/mp4;codecs=h264,aac',
-    'video/mp4',
-  ];
+  bestWebmMime: string | null;
+  recorderAvailable: boolean;
+}
 
-  const webmTypes = [
-    'video/webm;codecs=vp9,opus',
-    'video/webm;codecs=vp8,opus',
-    'video/webm;codecs=h264,opus',
-    'video/webm',
-  ];
-
-  let bestMp4Mime: string | null = null;
-  for (const type of mp4Types) {
-    if (typeof MediaRecorder !== 'undefined' && MediaRecorder.isTypeSupported(type)) {
-      bestMp4Mime = type;
-      break;
+function pickMime(candidates: string[]): string | null {
+  if (typeof MediaRecorder === 'undefined') return null;
+  for (const type of candidates) {
+    try {
+      if (MediaRecorder.isTypeSupported(type)) return type;
+    } catch {
+      /* ignore */
     }
   }
+  return null;
+}
 
-  let bestWebmMime = 'video/webm';
-  for (const type of webmTypes) {
-    if (typeof MediaRecorder !== 'undefined' && MediaRecorder.isTypeSupported(type)) {
-      bestWebmMime = type;
-      break;
-    }
-  }
-
+export function detectSupportedVideoFormats(highRes = false): FormatSupport {
+  // High profile level 5.1 is required for 4K; level 4.0 covers up to 1080p60.
+  const mp4 = highRes
+    ? ['video/mp4;codecs=avc1.640033,mp4a.40.2', 'video/mp4;codecs=avc1.4d0033,mp4a.40.2']
+    : ['video/mp4;codecs=avc1.640028,mp4a.40.2', 'video/mp4;codecs=avc1.4d0028,mp4a.40.2', 'video/mp4;codecs=avc1.42E01E,mp4a.40.2'];
+  mp4.push('video/mp4;codecs=avc1,mp4a.40.2', 'video/mp4;codecs=avc1,opus', 'video/mp4');
+  const webm = ['video/webm;codecs=vp9,opus', 'video/webm;codecs=vp8,opus', 'video/webm'];
+  const bestMp4Mime = pickMime(mp4);
+  const bestWebmMime = pickMime(webm);
   return {
     mp4Supported: !!bestMp4Mime,
     bestMp4Mime,
     bestWebmMime,
+    recorderAvailable: typeof MediaRecorder !== 'undefined',
   };
 }
 
-export class VideoExporter {
-  private isCancelled = false;
-  private mediaRecorder: MediaRecorder | null = null;
-  private recordedChunks: Blob[] = [];
+export function getExportDuration(settings: ExportSettings, audioDuration: number, startAt: number): number {
+  const remaining = Math.max(0, audioDuration - startAt);
+  switch (settings.durationMode) {
+    case '15s':
+      return Math.min(15, remaining);
+    case '30s':
+      return Math.min(30, remaining);
+    case '60s':
+      return Math.min(60, remaining);
+    case 'custom':
+      return Math.min(Math.max(1, settings.customDurationSeconds || 10), remaining);
+    default:
+      return remaining;
+  }
+}
 
-  public cancel() {
-    this.isCancelled = true;
-    if (this.mediaRecorder && this.mediaRecorder.state !== 'inactive') {
+export interface ExportResult {
+  blob: Blob;
+  url: string;
+  format: 'mp4' | 'webm';
+  mimeType: string;
+}
+
+/**
+ * Real-time exporter: plays the track through a private AudioContext, renders each frame
+ * driven by the audio clock (so video and audio can never drift) and records both with MediaRecorder.
+ */
+export class VideoExporter {
+  private cancelled = false;
+  private recorder: MediaRecorder | null = null;
+
+  cancel() {
+    this.cancelled = true;
+    if (this.recorder && this.recorder.state !== 'inactive') {
       try {
-        this.mediaRecorder.stop();
+        this.recorder.stop();
       } catch {
-        // Ignored
+        /* ignore */
       }
     }
   }
 
-  public async exportVideo(
+  async exportVideo(
     config: VisualizerConfig,
     settings: ExportSettings,
-    startOffsetSeconds = 0,
+    startOffsetSeconds: number,
     onProgress: (progress: ExportProgress) => void
-  ): Promise<{ blob: Blob; url: string; format: string }> {
-    this.isCancelled = false;
-    this.recordedChunks = [];
+  ): Promise<ExportResult> {
+    this.cancelled = false;
 
-    const audioBuffer = audioEngine.getAudioBuffer();
-    if (!audioBuffer) {
-      throw new Error('No audio buffer loaded. Please select or upload a song first.');
+    const buffer = audioEngine.getAudioBuffer();
+    if (!buffer) throw new Error('Nessun audio caricato. Carica un brano prima di esportare.');
+    if (typeof MediaRecorder === 'undefined') {
+      throw new Error('Questo browser non supporta MediaRecorder: usa Chrome, Edge o Firefox aggiornati.');
     }
 
-    // Determine target resolution dimensions
-    let width = 1920;
-    let height = 1080;
-    if (settings.resolution === '4k') {
-      width = 3840;
-      height = 2160;
-    } else if (settings.resolution === '720p') {
-      width = 1280;
-      height = 720;
-    } else if (settings.resolution === 'square') {
-      width = 1080;
-      height = 1080;
+    const { width, height } = RESOLUTION_SIZES[settings.resolution];
+    const start = Math.max(0, Math.min(startOffsetSeconds, buffer.duration - 0.5));
+    const duration = getExportDuration(settings, buffer.duration, start);
+    if (duration < 0.5) throw new Error('La durata da esportare è troppo breve. Sposta la testina più indietro.');
+
+    const support = detectSupportedVideoFormats(settings.resolution === '4k');
+    let mime: string | null = null;
+    let format: 'mp4' | 'webm' = 'webm';
+    if (settings.format === 'mp4' && support.bestMp4Mime) {
+      mime = support.bestMp4Mime;
+      format = 'mp4';
+    } else if (support.bestWebmMime) {
+      mime = support.bestWebmMime;
+    } else if (support.bestMp4Mime) {
+      mime = support.bestMp4Mime;
+      format = 'mp4';
     }
 
-    // Calculate duration in seconds
-    const audioDuration = audioBuffer.duration;
-    let durationSeconds = audioDuration;
-    if (settings.durationMode === '15s') durationSeconds = Math.min(15, audioDuration);
-    else if (settings.durationMode === '30s') durationSeconds = Math.min(30, audioDuration);
-    else if (settings.durationMode === '60s') durationSeconds = Math.min(60, audioDuration);
-    else if (settings.durationMode === 'custom' && settings.customDurationSeconds) {
-      durationSeconds = Math.min(settings.customDurationSeconds, audioDuration);
-    }
+    onProgress({
+      isExporting: true,
+      progressPercent: 0,
+      currentFrame: 0,
+      totalFrames: Math.ceil(duration * settings.fps),
+      elapsedSeconds: 0,
+      etaSeconds: duration,
+      statusText: 'Preparazione risorse…',
+    });
 
-    const clampedStart = Math.min(startOffsetSeconds, Math.max(0, audioDuration - durationSeconds));
+    // Canvas & renderer
+    const canvas = document.createElement('canvas');
+    canvas.width = width;
+    canvas.height = height;
+    const ctx = canvas.getContext('2d', { alpha: false });
+    if (!ctx) throw new Error('Impossibile creare il canvas di rendering.');
 
-    // Determine target MIME type
-    const formatSupport = detectSupportedVideoFormats();
-    let chosenMime = formatSupport.bestWebmMime;
-    let finalFormat = 'webm';
-
-    if (settings.format === 'mp4' && formatSupport.mp4Supported && formatSupport.bestMp4Mime) {
-      chosenMime = formatSupport.bestMp4Mime;
-      finalFormat = 'mp4';
-    } else if (settings.format === 'mp4' && !formatSupport.mp4Supported) {
-      // Browser does not support direct MP4 encoding via MediaRecorder, gracefully fallback to WebM
-      chosenMime = formatSupport.bestWebmMime;
-      finalFormat = 'webm';
-    }
-
-    // Create high-res offscreen rendering canvas
-    const exportCanvas = document.createElement('canvas');
-    exportCanvas.width = width;
-    exportCanvas.height = height;
-    const ctx = exportCanvas.getContext('2d', { alpha: false });
-    if (!ctx) {
-      throw new Error('Failed to create 2D canvas context for export.');
-    }
-
-    // Create fresh renderer instance for export
     const renderer = new VisualizerRenderer();
-    renderer.initParticles(config, width, height);
+    await Promise.all([
+      renderer.preloadImage(config.backgroundUrl),
+      renderer.preloadImage(config.logoUrl),
+      document.fonts?.ready ?? Promise.resolve(),
+    ]);
+    if (this.cancelled) throw new Error('Esportazione annullata.');
 
-    // Preload background and logo images so they are ready at full resolution
-    if (config.backgroundUrl) await renderer.preloadImage(config.backgroundUrl);
-    if (config.logoUrl) await renderer.preloadImage(config.logoUrl);
+    // Private audio graph: source -> analyser -> recorder stream (silent to speakers)
+    const Ctor = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+    const audioCtx = new Ctor();
+    await audioCtx.resume().catch(() => {});
+    const source = audioCtx.createBufferSource();
+    source.buffer = buffer;
+    const analyser = audioCtx.createAnalyser();
+    configureAnalyser(analyser);
+    const dest = audioCtx.createMediaStreamDestination();
+    source.connect(analyser);
+    analyser.connect(dest);
+    const bands = new BandAnalyzer(analyser);
 
-    // Audio setup for export: create dedicated Offline/Live WebAudio playback stream
-    const audioCtx = new (window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext)();
-    const audioSource = audioCtx.createBufferSource();
-    audioSource.buffer = audioBuffer;
+    const stream = new MediaStream([...canvas.captureStream(settings.fps).getVideoTracks(), ...dest.stream.getAudioTracks()]);
 
-    const exportAnalyser = audioCtx.createAnalyser();
-    exportAnalyser.fftSize = 1024;
-    exportAnalyser.smoothingTimeConstant = config.smoothing;
-
-    const audioStreamDest = audioCtx.createMediaStreamDestination();
-    audioSource.connect(exportAnalyser);
-    audioSource.connect(audioStreamDest);
-
-    // Capture canvas stream at specified FPS
-    const canvasStream = exportCanvas.captureStream(settings.fps);
-
-    // Combine video track and audio track
-    const combinedTracks = [
-      ...canvasStream.getVideoTracks(),
-      ...audioStreamDest.stream.getAudioTracks(),
-    ];
-    const combinedStream = new MediaStream(combinedTracks);
-
-    // Bitrate calculation
-    const videoBitsPerSecond = (settings.bitrateMbps || 20) * 1_000_000;
-
-    let mediaRecorder: MediaRecorder;
+    const options: MediaRecorderOptions = {
+      videoBitsPerSecond: Math.round((settings.bitrateMbps || 16) * 1_000_000),
+      audioBitsPerSecond: 256_000,
+    };
+    if (mime) options.mimeType = mime;
+    let recorder: MediaRecorder;
     try {
-      mediaRecorder = new MediaRecorder(combinedStream, {
-        mimeType: chosenMime,
-        videoBitsPerSecond,
-      });
+      recorder = new MediaRecorder(stream, options);
     } catch {
-      // Fallback to default WebM if exact codec string fails
-      mediaRecorder = new MediaRecorder(combinedStream, {
-        videoBitsPerSecond,
-      });
-      chosenMime = mediaRecorder.mimeType || 'video/webm';
-      finalFormat = chosenMime.includes('mp4') ? 'mp4' : 'webm';
+      recorder = new MediaRecorder(stream);
     }
-    this.mediaRecorder = mediaRecorder;
+    this.recorder = recorder;
+    const finalMime = recorder.mimeType || mime || 'video/webm';
+    if (finalMime.includes('mp4')) format = 'mp4';
+    else format = 'webm';
 
     const chunks: Blob[] = [];
-    mediaRecorder.ondataavailable = (e) => {
-      if (e.data && e.data.size > 0) {
-        chunks.push(e.data);
-      }
+    recorder.ondataavailable = (e) => {
+      if (e.data && e.data.size > 0) chunks.push(e.data);
     };
 
-    const freqData = new Uint8Array(exportAnalyser.frequencyBinCount);
-    const timeData = new Uint8Array(exportAnalyser.frequencyBinCount);
-    const hzPerBin = (audioCtx.sampleRate / 2) / exportAnalyser.frequencyBinCount;
+    const totalFrames = Math.ceil(duration * settings.fps);
+    const wallStart = performance.now();
 
-    const getRangeEnergy = (startHz: number, endHz: number): number => {
-      const startBin = Math.max(0, Math.floor(startHz / hzPerBin));
-      const endBin = Math.min(exportAnalyser.frequencyBinCount - 1, Math.ceil(endHz / hzPerBin));
-      if (startBin >= endBin) return 0;
-      let sum = 0;
-      for (let i = startBin; i <= endBin; i++) {
-        sum += freqData[i];
-      }
-      return (sum / (endBin - startBin + 1)) / 255;
-    };
+    // Prime first frame so the video doesn't start black
+    renderer.renderFrame(ctx, width, height, bands.analyze(0), config, 0, start);
 
-    // Helper to get real-time FFT frequency analysis
-    const analyzeExport = () => {
-      exportAnalyser.getByteFrequencyData(freqData);
-      exportAnalyser.getByteTimeDomainData(timeData);
+    return new Promise<ExportResult>((resolve, reject) => {
+      let finished = false;
+      let timer: number | null = null;
 
-      const subBass = getRangeEnergy(20, 70);
-      const bass = getRangeEnergy(70, 250);
-      const lowMid = getRangeEnergy(250, 600);
-      const mid = getRangeEnergy(600, 2500);
-      const treble = getRangeEnergy(2500, 10000);
-      const peakEnergy = Math.max(subBass, bass, mid);
-      const isBeatHit = (subBass * 0.7 + bass * 0.3) > 0.55;
-
-      return {
-        frequencyData: freqData,
-        timeDomainData: timeData,
-        subBass,
-        bass,
-        lowMid,
-        mid,
-        treble,
-        peakEnergy,
-        isBeatHit,
+      const cleanup = () => {
+        if (timer !== null) {
+          cancelAnimationFrame(timer);
+          clearTimeout(timer);
+        }
+        try {
+          source.stop();
+        } catch {
+          /* ignore */
+        }
+        stream.getTracks().forEach((t) => t.stop());
+        audioCtx.close().catch(() => {});
+        this.recorder = null;
       };
-    };
 
-    const totalFrames = Math.ceil(durationSeconds * settings.fps);
-    const startTimeStamp = performance.now();
-
-    return new Promise<{ blob: Blob; url: string; format: string }>((resolve, reject) => {
-      mediaRecorder.onstop = () => {
-        audioSource.stop();
-        audioCtx.close();
-
-        if (this.isCancelled) {
-          reject(new Error('Export cancelled by user.'));
+      recorder.onstop = () => {
+        cleanup();
+        if (this.cancelled) {
+          reject(new Error('Esportazione annullata.'));
           return;
         }
-
-        const finalBlob = new Blob(chunks, { type: chosenMime });
-        const finalUrl = URL.createObjectURL(finalBlob);
-
+        const blob = new Blob(chunks, { type: finalMime.split(';')[0] });
+        if (!blob.size) {
+          reject(new Error('Il browser non ha prodotto dati video. Riprova con WebM o una risoluzione inferiore.'));
+          return;
+        }
+        const url = URL.createObjectURL(blob);
         onProgress({
           isExporting: false,
           progressPercent: 100,
           currentFrame: totalFrames,
           totalFrames,
-          elapsedSeconds: (performance.now() - startTimeStamp) / 1000,
+          elapsedSeconds: (performance.now() - wallStart) / 1000,
           etaSeconds: 0,
-          statusText: 'Export completed successfully!',
-          completedBlobUrl: finalUrl,
+          statusText: 'Video pronto!',
+          completedBlobUrl: url,
         });
-
-        resolve({
-          blob: finalBlob,
-          url: finalUrl,
-          format: finalFormat,
-        });
+        resolve({ blob, url, format, mimeType: finalMime });
       };
 
-      mediaRecorder.onerror = (err) => {
-        audioSource.stop();
-        audioCtx.close();
-        reject(err);
+      recorder.onerror = (ev) => {
+        cleanup();
+        const err = (ev as unknown as { error?: Error }).error;
+        reject(new Error(err?.message || 'Errore del registratore video.'));
       };
 
-      // Start recording
-      mediaRecorder.start(250); // collect chunk slices
-      audioSource.start(0, clampedStart, durationSeconds);
+      recorder.start(500);
+      const startAt = audioCtx.currentTime + 0.12;
+      source.start(startAt, start, duration);
 
-      let frameCounter = 0;
-      const frameIntervalMs = 1000 / settings.fps;
-      let lastFrameTime = performance.now();
-
-      const renderLoop = () => {
-        if (this.isCancelled) {
-          mediaRecorder.stop();
+      let lastAudioTime = 0;
+      const tick = () => {
+        if (finished) return;
+        if (this.cancelled) {
+          finished = true;
+          if (recorder.state !== 'inactive') recorder.stop();
           return;
         }
+        const t = Math.max(0, audioCtx.currentTime - startAt);
+        const dtMs = (t - lastAudioTime) * 1000;
+        lastAudioTime = t;
+        renderer.renderFrame(ctx, width, height, bands.analyze(t * 1000), config, dtMs, start + t);
 
-        const now = performance.now();
-        const delta = now - lastFrameTime;
+        const progress = Math.min(1, t / duration);
+        const elapsed = (performance.now() - wallStart) / 1000;
+        onProgress({
+          isExporting: true,
+          progressPercent: progress * 100,
+          currentFrame: Math.min(totalFrames, Math.floor(t * settings.fps)),
+          totalFrames,
+          elapsedSeconds: elapsed,
+          etaSeconds: Math.max(0, duration - t),
+          statusText: `Registrazione ${RESOLUTION_SIZES[settings.resolution].label} · ${settings.fps} fps`,
+        });
 
-        if (delta >= frameIntervalMs - 2) {
-          lastFrameTime = now;
-          frameCounter++;
-
-          // Analyze audio and render high-res frame
-          const analysis = analyzeExport();
-          renderer.renderFrame(ctx, width, height, analysis, config, frameIntervalMs);
-
-          // Update progress metrics
-          const progressPercent = Math.min(99.5, (frameCounter / totalFrames) * 100);
-          const elapsedSec = (now - startTimeStamp) / 1000;
-          const framesRemaining = totalFrames - frameCounter;
-          const fpsActual = frameCounter / Math.max(0.1, elapsedSec);
-          const etaSec = Math.max(0, framesRemaining / Math.max(1, fpsActual));
-
+        if (t >= duration + 0.05) {
+          finished = true;
           onProgress({
             isExporting: true,
-            progressPercent,
-            currentFrame: frameCounter,
+            progressPercent: 100,
+            currentFrame: totalFrames,
             totalFrames,
-            elapsedSeconds: elapsedSec,
-            etaSeconds: etaSec,
-            statusText: `Rendering ${settings.resolution.toUpperCase()} (${frameCounter}/${totalFrames} frames)`,
+            elapsedSeconds: elapsed,
+            etaSeconds: 0,
+            statusText: 'Finalizzazione del file…',
           });
-
-          if (frameCounter >= totalFrames) {
-            onProgress({
-              isExporting: true,
-              progressPercent: 99.9,
-              currentFrame: totalFrames,
-              totalFrames,
-              elapsedSeconds: elapsedSec,
-              etaSeconds: 0,
-              statusText: 'Finalizing video stream & audio muxing...',
-            });
-            mediaRecorder.stop();
-            return;
-          }
+          // small tail so the encoder flushes the last frames
+          setTimeout(() => recorder.state !== 'inactive' && recorder.stop(), 150);
+          return;
         }
-
-        requestAnimationFrame(renderLoop);
+        // rAF pauses in background tabs; fall back to timers so the export keeps going.
+        timer = document.hidden ? window.setTimeout(tick, 1000 / settings.fps) : requestAnimationFrame(tick);
       };
-
-      // Kick off render loop
-      requestAnimationFrame(renderLoop);
+      timer = requestAnimationFrame(tick);
     });
   }
 }

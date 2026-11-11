@@ -1,1107 +1,1682 @@
 import { VisualizerConfig, TextLayer } from '../types/visualizer';
-import { FrequencyAnalysis } from '../audio/audioEngine';
+import { FrequencyAnalysis } from '../audio/analysis';
+import { shiftHue, withAlpha } from './color';
 
-export interface Particle {
+/**
+ * Resolution-independent canvas renderer.
+ *
+ * All geometry is expressed relative to the frame (u = min(width,height)/1000),
+ * and all motion is time-based, so the live preview and a 4K export look identical
+ * whatever the frame rate.
+ */
+
+interface Particle {
   x: number;
   y: number;
   vx: number;
   vy: number;
-  size: number;
   baseSize: number;
-  alpha: number;
   maxAlpha: number;
-  color: string;
-  life: number;
-  maxLife: number;
-  twinkleSpeed: number;
+  life: number; // seconds
+  maxLife: number; // seconds
+  twinkle: number;
+  phase: number;
+}
+
+interface Ring {
+  r: number;
+  alpha: number;
+  width: number;
+}
+
+export interface TextBounds {
+  id: string;
+  /** Bounding box in frame pixels (unrotated). */
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
+
+interface Palette {
+  primary: string;
+  secondary: string;
+  glow: string;
+  particle: string;
+  logoBorder: string;
+}
+
+type Ctx = CanvasRenderingContext2D;
+
+function makeCanvas(w: number, h: number): HTMLCanvasElement {
+  const c = document.createElement('canvas');
+  c.width = Math.max(1, Math.round(w));
+  c.height = Math.max(1, Math.round(h));
+  return c;
+}
+
+function drawImageCover(ctx: Ctx, img: CanvasImageSource & { width: number; height: number }, x: number, y: number, w: number, h: number) {
+  const iw = (img as HTMLImageElement).naturalWidth || img.width;
+  const ih = (img as HTMLImageElement).naturalHeight || img.height;
+  if (!iw || !ih) return;
+  const r = Math.max(w / iw, h / ih);
+  const sw = w / r;
+  const sh = h / r;
+  ctx.drawImage(img, (iw - sw) / 2, (ih - sh) / 2, sw, sh, x, y, w, h);
+}
+
+function hexPath(ctx: Ctx, cx: number, cy: number, r: number, rotation = -Math.PI / 2) {
+  ctx.beginPath();
+  for (let i = 0; i < 6; i++) {
+    const a = rotation + (i * Math.PI) / 3;
+    const px = cx + Math.cos(a) * r;
+    const py = cy + Math.sin(a) * r;
+    if (i === 0) ctx.moveTo(px, py);
+    else ctx.lineTo(px, py);
+  }
+  ctx.closePath();
+}
+
+/** Smooth closed/open curve through points using quadratic mid-point interpolation. */
+function smoothPath(ctx: Ctx, pts: { x: number; y: number }[], closed: boolean) {
+  const n = pts.length;
+  if (n < 2) return;
+  if (closed) {
+    const last = pts[n - 1];
+    const first = pts[0];
+    ctx.moveTo((last.x + first.x) / 2, (last.y + first.y) / 2);
+    for (let i = 0; i < n; i++) {
+      const p = pts[i];
+      const q = pts[(i + 1) % n];
+      ctx.quadraticCurveTo(p.x, p.y, (p.x + q.x) / 2, (p.y + q.y) / 2);
+    }
+    ctx.closePath();
+  } else {
+    ctx.moveTo(pts[0].x, pts[0].y);
+    for (let i = 1; i < n - 1; i++) {
+      const p = pts[i];
+      const q = pts[i + 1];
+      ctx.quadraticCurveTo(p.x, p.y, (p.x + q.x) / 2, (p.y + q.y) / 2);
+    }
+    ctx.lineTo(pts[n - 1].x, pts[n - 1].y);
+  }
 }
 
 export class VisualizerRenderer {
   private particles: Particle[] = [];
-  private imageCache: Map<string, HTMLImageElement> = new Map();
-  private smoothedBars: number[] = [];
+  private particleKey = '';
+  private imageCache = new Map<string, HTMLImageElement>();
+  private spectrumState = new Map<number, Float32Array>();
+  private peakState = new Map<number, Float32Array>();
+  private rings: Ring[] = [];
+  private flash = 0;
   private shakeX = 0;
   private shakeY = 0;
-  private currentScale = 1;
-  private totalTimeMs = 0;
-  private vinylRotationAngle = 0;
+  private zoom = 1;
+  private timeSec = 0;
+  private vinylAngle = 0;
+  private logoAngle = 0;
+  private bassSmooth = 0;
 
-  public initParticles(config: VisualizerConfig, width: number, height: number) {
+  // Offscreen buffers
+  private layer: HTMLCanvasElement | null = null;
+  private tint: HTMLCanvasElement | null = null;
+  private bgCache: { key: string; canvas: HTMLCanvasElement } | null = null;
+  private grain: HTMLCanvasElement | null = null;
+  private sprites = new Map<string, HTMLCanvasElement>();
+
+  /** Text layer bounding boxes from the last rendered frame (for hit-testing & gizmos). */
+  public lastTextBounds: TextBounds[] = [];
+
+  // ------------------------------------------------------------------ public API
+
+  reset() {
     this.particles = [];
-    const count = config.particleCount || 200;
-    for (let i = 0; i < count; i++) {
-      this.particles.push(this.createParticle(config, width, height, true));
-    }
+    this.particleKey = '';
+    this.spectrumState.clear();
+    this.peakState.clear();
+    this.rings = [];
+    this.flash = 0;
+    this.shakeX = this.shakeY = 0;
+    this.zoom = 1;
+    this.timeSec = 0;
+    this.vinylAngle = 0;
+    this.logoAngle = 0;
+    this.bassSmooth = 0;
   }
 
-  private getCenter(config: VisualizerConfig, width: number, height: number) {
-    const cx = ((config.visualizerX !== undefined ? config.visualizerX : 50) / 100) * width;
-    const cy = ((config.visualizerY !== undefined ? config.visualizerY : 50) / 100) * height;
-    const scale = config.visualizerScale !== undefined ? config.visualizerScale : 1.0;
+  preloadImage(url: string): Promise<HTMLImageElement | null> {
+    if (!url) return Promise.resolve(null);
+    const cached = this.imageCache.get(url);
+    if (cached && cached.complete && cached.naturalWidth > 0) return Promise.resolve(cached);
+    return new Promise((resolve) => {
+      const img = cached || new Image();
+      if (!cached) {
+        if (!url.startsWith('data:') && !url.startsWith('blob:')) img.crossOrigin = 'anonymous';
+        this.imageCache.set(url, img);
+      }
+      const done = () => resolve(img.naturalWidth > 0 ? img : null);
+      img.addEventListener('load', done, { once: true });
+      img.addEventListener('error', () => resolve(null), { once: true });
+      if (!cached) img.src = url;
+      else if (img.complete) done();
+    });
+  }
+
+  private getImage(url: string): HTMLImageElement | null {
+    if (!url) return null;
+    let img = this.imageCache.get(url);
+    if (!img) {
+      img = new Image();
+      if (!url.startsWith('data:') && !url.startsWith('blob:')) img.crossOrigin = 'anonymous';
+      img.src = url;
+      this.imageCache.set(url, img);
+    }
+    return img.complete && img.naturalWidth > 0 ? img : null;
+  }
+
+  /**
+   * Draws one frame.
+   * @param dtMs  elapsed real time since previous frame
+   * @param playbackTime  current position in the track (seconds), used for text intro animations
+   */
+  renderFrame(
+    ctx: Ctx,
+    width: number,
+    height: number,
+    analysis: FrequencyAnalysis,
+    config: VisualizerConfig,
+    dtMs = 16.67,
+    playbackTime = 0
+  ) {
+    const dt = Math.max(0, Math.min(0.1, dtMs / 1000));
+    const k = dt * 60; // frame-normalised step
+    this.timeSec += dt;
+
+    const u = Math.min(width, height) / 1000;
+    const bass = analysis.bassWeight;
+    this.bassSmooth += (bass - this.bassSmooth) * Math.min(1, dt * 14);
+
+    const hue = config.colorCycleSpeed ? (this.timeSec * config.colorCycleSpeed) % 360 : 0;
+    const pal: Palette = {
+      primary: shiftHue(config.primaryColor, hue),
+      secondary: shiftHue(config.secondaryColor, hue),
+      glow: shiftHue(config.glowColor, hue),
+      particle: shiftHue(config.particleColor, hue),
+      logoBorder: shiftHue(config.logoBorderColor, hue),
+    };
+
+    // ---- beat-driven state
+    if (analysis.isBeatHit) {
+      if (config.beatFlash) this.flash = Math.min(1, 0.55 + bass * 0.5);
+      if (config.shockwaveRings && this.rings.length < 8) {
+        const { minDim } = this.center(config, width, height);
+        this.rings.push({ r: minDim * config.innerRadiusRatio, alpha: 0.75, width: 6 * u });
+      }
+    }
+    this.flash = Math.max(0, this.flash - dt * 3.2);
+
+    // ---- camera
+    let tsx = 0;
+    let tsy = 0;
+    if (config.bassCameraShake && bass > 0.42) {
+      const mag = (bass - 0.42) * 26 * u;
+      tsx = (Math.random() - 0.5) * mag;
+      tsy = (Math.random() - 0.5) * mag;
+    }
+    const easing = Math.min(1, dt * 15);
+    this.shakeX += (tsx - this.shakeX) * easing;
+    this.shakeY += (tsy - this.shakeY) * easing;
+    const targetZoom = 1 + this.bassSmooth * (config.bassZoomIntensity || 0);
+    this.zoom += (targetZoom - this.zoom) * Math.min(1, dt * 12);
+
+    const { cx, cy } = this.center(config, width, height);
+
+    ctx.save();
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.globalAlpha = 1;
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.filter = 'none';
+
+    // ---- 1. background (with its own gentle parallax)
+    this.renderBackground(ctx, width, height, config, u);
+
+    // ---- 2. visualizer + particles into a layer (for chromatic split)
+    const layer = this.ensureLayer(width, height);
+    const lctx = layer.getContext('2d')!;
+    lctx.setTransform(1, 0, 0, 1, 0, 0);
+    lctx.clearRect(0, 0, width, height);
+    lctx.translate(cx + this.shakeX, cy + this.shakeY);
+    lctx.scale(this.zoom, this.zoom);
+    lctx.translate(-cx, -cy);
+
+    this.renderRings(lctx, config, width, height, pal, u, k);
+    this.renderParticles(lctx, width, height, config, analysis, pal, u, dt, k);
+    this.renderByLayout(lctx, width, height, config, analysis, pal, u, dt);
+    lctx.setTransform(1, 0, 0, 1, 0, 0);
+
+    const chroma = (config.chromaticAberration || 0) * Math.max(0, this.bassSmooth - 0.25) * 1.6;
+    if (chroma > 0.02) {
+      const off = chroma * 14 * u;
+      const tint = this.ensureTint(width, height);
+      const tctx = tint.getContext('2d')!;
+      ctx.save();
+      ctx.globalCompositeOperation = 'lighter';
+      ctx.globalAlpha = Math.min(0.55, chroma);
+      for (const [color, dx] of [
+        ['#ff2a55', -off],
+        ['#22e1ff', off],
+      ] as const) {
+        tctx.globalCompositeOperation = 'source-over';
+        tctx.clearRect(0, 0, width, height);
+        tctx.drawImage(layer, 0, 0);
+        tctx.globalCompositeOperation = 'source-in';
+        tctx.fillStyle = color;
+        tctx.fillRect(0, 0, width, height);
+        ctx.drawImage(tint, dx, 0);
+      }
+      ctx.restore();
+    }
+    ctx.drawImage(layer, 0, 0);
+
+    // ---- 3. beat flash
+    if (this.flash > 0.01) {
+      const g = ctx.createRadialGradient(cx, cy, 0, cx, cy, Math.max(width, height) * 0.75);
+      g.addColorStop(0, withAlpha(pal.glow, this.flash * 0.35));
+      g.addColorStop(0.5, withAlpha(pal.glow, this.flash * 0.12));
+      g.addColorStop(1, 'rgba(0,0,0,0)');
+      ctx.save();
+      ctx.globalCompositeOperation = 'lighter';
+      ctx.fillStyle = g;
+      ctx.fillRect(0, 0, width, height);
+      ctx.restore();
+    }
+
+    // ---- 4. text layers
+    this.renderTypography(ctx, width, height, config, bass, playbackTime);
+
+    // ---- 5. film grain
+    if (config.filmGrain > 0) this.renderGrain(ctx, width, height, config.filmGrain, u);
+
+    ctx.restore();
+  }
+
+  // ------------------------------------------------------------------ helpers
+
+  private center(config: VisualizerConfig, width: number, height: number) {
+    const cx = ((config.visualizerX ?? 50) / 100) * width;
+    const cy = ((config.visualizerY ?? 50) / 100) * height;
+    const scale = config.visualizerScale ?? 1;
     const minDim = Math.min(width, height) * scale;
     return { cx, cy, scale, minDim };
   }
 
-  private createParticle(config: VisualizerConfig, width: number, height: number, randomStart = false): Particle {
-    const { cx, cy, minDim } = this.getCenter(config, width, height);
-    const innerRadius = minDim * config.innerRadiusRatio;
-    const dispersion = config.particleDispersion || 'radial';
+  private ensureLayer(w: number, h: number) {
+    if (!this.layer || this.layer.width !== w || this.layer.height !== h) this.layer = makeCanvas(w, h);
+    return this.layer;
+  }
 
-    let x = cx;
-    let y = cy;
-    let vx = 0;
-    let vy = 0;
-    const speed = (config.particleMinSpeed + Math.random() * (config.particleMaxSpeed - config.particleMinSpeed)) * (minDim / 800);
+  private ensureTint(w: number, h: number) {
+    if (!this.tint || this.tint.width !== w || this.tint.height !== h) this.tint = makeCanvas(w, h);
+    return this.tint;
+  }
 
-    if (dispersion === 'upward') {
-      x = Math.random() * width;
-      y = randomStart ? Math.random() * height : height + 20;
-      vx = (Math.random() - 0.5) * speed * 0.5;
-      vy = -speed * (0.8 + Math.random() * 0.8);
-    } else if (dispersion === 'ambient') {
-      x = Math.random() * width;
-      y = Math.random() * height;
-      vx = (Math.random() - 0.5) * speed * 0.4;
-      vy = (Math.random() - 0.5) * speed * 0.4;
+  /** Soft radial sprite used for glowing particles (much cheaper than shadowBlur). */
+  private sprite(color: string, glow: boolean): HTMLCanvasElement {
+    const key = `${color}|${glow}`;
+    let s = this.sprites.get(key);
+    if (s) return s;
+    const size = 64;
+    s = makeCanvas(size, size);
+    const c = s.getContext('2d')!;
+    const g = c.createRadialGradient(size / 2, size / 2, 0, size / 2, size / 2, size / 2);
+    if (glow) {
+      g.addColorStop(0, 'rgba(255,255,255,1)');
+      g.addColorStop(0.12, withAlpha(color, 1));
+      g.addColorStop(0.35, withAlpha(color, 0.35));
+      g.addColorStop(1, withAlpha(color, 0));
     } else {
-      // Radial from center
-      const angle = Math.random() * Math.PI * 2;
-      const distance = randomStart 
-        ? innerRadius + Math.random() * (minDim * 0.45)
-        : innerRadius + Math.random() * 15;
-      x = cx + Math.cos(angle) * distance;
-      y = cy + Math.sin(angle) * distance;
-      vx = Math.cos(angle) * speed;
-      vy = Math.sin(angle) * speed;
+      g.addColorStop(0, withAlpha(color, 1));
+      g.addColorStop(0.3, withAlpha(color, 1));
+      g.addColorStop(0.42, withAlpha(color, 0));
+      g.addColorStop(1, withAlpha(color, 0));
+    }
+    c.fillStyle = g;
+    c.fillRect(0, 0, size, size);
+    if (this.sprites.size > 48) this.sprites.clear();
+    this.sprites.set(key, s);
+    return s;
+  }
+
+  /** Log-spaced, attack/decay-smoothed spectrum with `count` bands (0–1). */
+  private spectrum(count: number, analysis: FrequencyAnalysis, smoothing: number): Float32Array {
+    let state = this.spectrumState.get(count);
+    if (!state) {
+      state = new Float32Array(count);
+      this.spectrumState.set(count, state);
+    }
+    const data = analysis.frequencyData;
+    const bins = data.length;
+    const hzPerBin = analysis.sampleRate / 2 / bins;
+    const fMin = 32;
+    const fMax = Math.min(15000, analysis.sampleRate / 2);
+    const logMin = Math.log(fMin);
+    const logRange = Math.log(fMax) - logMin;
+    const decay = Math.max(0, Math.min(0.97, smoothing));
+
+    for (let i = 0; i < count; i++) {
+      const f0 = Math.exp(logMin + (i / count) * logRange);
+      const f1 = Math.exp(logMin + ((i + 1) / count) * logRange);
+      let b0 = Math.floor(f0 / hzPerBin);
+      let b1 = Math.max(b0, Math.floor(f1 / hzPerBin));
+      b0 = Math.min(bins - 1, b0);
+      b1 = Math.min(bins - 1, b1);
+      let max = 0;
+      for (let b = b0; b <= b1; b++) if (data[b] > max) max = data[b];
+      // gentle tilt so highs are visible next to heavy lows
+      const tilt = 0.8 + Math.pow(i / count, 0.8) * 0.55;
+      let v = Math.min(1, (max / 255) * tilt);
+      v = v * v * (3 - 2 * v) * 0.85 + v * 0.15; // soft contrast curve
+      const prev = state[i];
+      state[i] = v > prev ? prev + (v - prev) * 0.65 : prev * decay + v * (1 - decay);
+    }
+    return state;
+  }
+
+  private peaks(values: Float32Array, dt: number): Float32Array {
+    let p = this.peakState.get(values.length);
+    if (!p) {
+      p = new Float32Array(values.length);
+      this.peakState.set(values.length, p);
+    }
+    for (let i = 0; i < values.length; i++) {
+      p[i] = values[i] >= p[i] ? values[i] : Math.max(values[i], p[i] - dt * 0.55);
+    }
+    return p;
+  }
+
+  /** Returns value for bar i, optionally mirrored so lows sit at both ends. */
+  private mirrored(values: Float32Array, i: number, total: number, mirror: boolean) {
+    if (!mirror) return values[Math.floor((i / total) * values.length)];
+    const half = total / 2;
+    const idx = i < half ? i : total - 1 - i;
+    return values[Math.min(values.length - 1, Math.floor((idx / half) * values.length))];
+  }
+
+  private applyGlow(ctx: Ctx, config: VisualizerConfig, color: string, u: number, mult = 1) {
+    if (config.glowIntensity > 0) {
+      ctx.shadowBlur = config.glowIntensity * u * 1.4 * mult;
+      ctx.shadowColor = color;
+    } else {
+      ctx.shadowBlur = 0;
+    }
+  }
+
+  // ------------------------------------------------------------------ background
+
+  private renderBackground(ctx: Ctx, width: number, height: number, config: VisualizerConfig, u: number) {
+    const img = this.getImage(config.backgroundUrl);
+    if (img) {
+      const margin = config.backgroundParallax ? 0.06 : 0;
+      const bw = Math.round(width * (1 + margin));
+      const bh = Math.round(height * (1 + margin));
+      const blurPx = (config.backgroundBlur || 0) * u * 0.9;
+      const key = `${config.backgroundUrl.length}|${config.backgroundUrl.slice(-48)}|${bw}x${bh}|${blurPx.toFixed(1)}`;
+      if (!this.bgCache || this.bgCache.key !== key) {
+        const c = makeCanvas(bw, bh);
+        const cctx = c.getContext('2d')!;
+        if (blurPx > 0) {
+          // draw slightly larger to hide blurred transparent edges
+          const pad = blurPx * 2.5;
+          cctx.filter = `blur(${blurPx}px)`;
+          drawImageCover(cctx, img, -pad, -pad, bw + pad * 2, bh + pad * 2);
+          cctx.filter = 'none';
+        } else {
+          drawImageCover(cctx, img, 0, 0, bw, bh);
+        }
+        this.bgCache = { key, canvas: c };
+      }
+      let ox = (width - bw) / 2;
+      let oy = (height - bh) / 2;
+      if (config.backgroundParallax) {
+        ox += Math.sin(this.timeSec * 0.13) * width * margin * 0.35 - this.shakeX * 0.3;
+        oy += Math.cos(this.timeSec * 0.11) * height * margin * 0.35 - this.shakeY * 0.3;
+      }
+      const z = 1 + (this.zoom - 1) * 0.4;
+      ctx.save();
+      ctx.translate(width / 2, height / 2);
+      ctx.scale(z, z);
+      ctx.translate(-width / 2, -height / 2);
+      ctx.drawImage(this.bgCache.canvas, ox, oy);
+      ctx.restore();
+    } else {
+      const g = ctx.createRadialGradient(width / 2, height * 0.45, 0, width / 2, height / 2, Math.max(width, height) * 0.8);
+      g.addColorStop(0, '#1b1530');
+      g.addColorStop(0.55, '#0b0a14');
+      g.addColorStop(1, '#030305');
+      ctx.fillStyle = g;
+      ctx.fillRect(0, 0, width, height);
     }
 
-    const baseSize = config.particleSize * (0.6 + Math.random() * 0.8) * (minDim / 800);
+    if (config.backgroundDim > 0) {
+      ctx.fillStyle = `rgba(0,0,0,${Math.min(0.95, config.backgroundDim)})`;
+      ctx.fillRect(0, 0, width, height);
+    }
 
+    if (config.backgroundVignette > 0) {
+      const { cx, cy } = this.center(config, width, height);
+      const radius = Math.hypot(width, height) * 0.6;
+      const v = ctx.createRadialGradient(cx, cy, radius * 0.25, cx, cy, radius);
+      v.addColorStop(0, 'rgba(0,0,0,0)');
+      v.addColorStop(0.65, `rgba(0,0,0,${config.backgroundVignette * 0.45})`);
+      v.addColorStop(1, `rgba(0,0,0,${Math.min(1, config.backgroundVignette * 1.05)})`);
+      ctx.fillStyle = v;
+      ctx.fillRect(0, 0, width, height);
+    }
+  }
+
+  private renderGrain(ctx: Ctx, width: number, height: number, amount: number, u: number) {
+    if (!this.grain) {
+      const size = 200;
+      this.grain = makeCanvas(size, size);
+      const g = this.grain.getContext('2d')!;
+      const img = g.createImageData(size, size);
+      for (let i = 0; i < img.data.length; i += 4) {
+        const v = Math.random() * 255;
+        img.data[i] = img.data[i + 1] = img.data[i + 2] = v;
+        img.data[i + 3] = 255;
+      }
+      g.putImageData(img, 0, 0);
+    }
+    const pattern = ctx.createPattern(this.grain, 'repeat');
+    if (!pattern) return;
+    const scale = Math.max(1, u * 1.2);
+    const ox = Math.random() * 200;
+    const oy = Math.random() * 200;
+    pattern.setTransform(new DOMMatrix([scale, 0, 0, scale, ox, oy]));
+    ctx.save();
+    ctx.globalCompositeOperation = 'overlay';
+    ctx.globalAlpha = Math.min(0.5, amount * 0.35);
+    ctx.fillStyle = pattern;
+    ctx.fillRect(0, 0, width, height);
+    ctx.restore();
+  }
+
+  // ------------------------------------------------------------------ rings & particles
+
+  private renderRings(ctx: Ctx, config: VisualizerConfig, width: number, height: number, pal: Palette, u: number, k: number) {
+    if (!this.rings.length) return;
+    const { cx, cy, minDim } = this.center(config, width, height);
+    ctx.save();
+    ctx.globalCompositeOperation = 'lighter';
+    for (const ring of this.rings) {
+      ring.r += minDim * 0.009 * k;
+      ring.alpha *= Math.pow(0.95, k);
+      ring.width *= Math.pow(0.985, k);
+      ctx.strokeStyle = withAlpha(pal.glow, ring.alpha * 0.8);
+      ctx.lineWidth = Math.max(0.5, ring.width);
+      ctx.beginPath();
+      if (config.layoutStyle === 'album-art-pulse') {
+        const s = ring.r * 2.1;
+        ctx.roundRect(cx - s / 2, cy - s / 2, s, s, s * 0.06);
+      } else {
+        ctx.arc(cx, cy, ring.r, 0, Math.PI * 2);
+      }
+      ctx.stroke();
+    }
+    ctx.restore();
+    this.rings = this.rings.filter((r) => r.alpha > 0.02 && r.r < Math.hypot(width, height));
+  }
+
+  private spawnParticle(config: VisualizerConfig, width: number, height: number, initial: boolean): Particle {
+    const { cx, cy, minDim } = this.center(config, width, height);
+    const u = Math.min(width, height) / 1000;
+    const speed =
+      (config.particleMinSpeed + Math.random() * Math.max(0, config.particleMaxSpeed - config.particleMinSpeed)) * u * 1.25;
+    const mode = config.particleDispersion || 'radial';
+    let x: number;
+    let y: number;
+    let vx: number;
+    let vy: number;
+    if (mode === 'upward') {
+      x = Math.random() * width;
+      y = initial ? Math.random() * height : height + 10 * u;
+      vx = (Math.random() - 0.5) * speed * 0.5;
+      vy = -speed * (0.7 + Math.random() * 0.8);
+    } else if (mode === 'ambient') {
+      x = Math.random() * width;
+      y = Math.random() * height;
+      const a = Math.random() * Math.PI * 2;
+      vx = Math.cos(a) * speed * 0.35;
+      vy = Math.sin(a) * speed * 0.35;
+    } else {
+      const a = Math.random() * Math.PI * 2;
+      const r0 = minDim * config.innerRadiusRatio;
+      const dist = initial ? r0 + Math.random() * minDim * 0.6 : r0 * (0.95 + Math.random() * 0.15);
+      x = cx + Math.cos(a) * dist;
+      y = cy + Math.sin(a) * dist;
+      vx = Math.cos(a) * speed;
+      vy = Math.sin(a) * speed;
+    }
+    const maxLife = 3 + Math.random() * 4.5;
     return {
       x,
       y,
       vx,
       vy,
-      size: baseSize,
-      baseSize,
-      alpha: 0.1 + Math.random() * 0.7,
-      maxAlpha: 0.4 + Math.random() * 0.6,
-      color: config.particleColor,
-      life: 0,
-      maxLife: 140 + Math.random() * 220,
-      twinkleSpeed: 2 + Math.random() * 4,
+      baseSize: config.particleSize * (0.5 + Math.random() * 0.9) * u * 1.15,
+      maxAlpha: 0.35 + Math.random() * 0.65,
+      life: initial ? Math.random() * maxLife : 0,
+      maxLife,
+      twinkle: 1.5 + Math.random() * 4,
+      phase: Math.random() * Math.PI * 2,
     };
   }
 
-  public preloadImage(url: string): Promise<HTMLImageElement> {
-    if (this.imageCache.has(url)) {
-      return Promise.resolve(this.imageCache.get(url)!);
-    }
-    return new Promise((resolve) => {
-      const img = new Image();
-      img.crossOrigin = 'anonymous';
-      img.onload = () => {
-        this.imageCache.set(url, img);
-        resolve(img);
-      };
-      img.onerror = () => {
-        resolve(img);
-      };
-      img.src = url;
-    });
-  }
-
-  public getImage(url: string): HTMLImageElement | null {
-    if (!url) return null;
-    if (this.imageCache.has(url)) {
-      return this.imageCache.get(url)!;
-    }
-    const img = new Image();
-    img.crossOrigin = 'anonymous';
-    img.src = url;
-    this.imageCache.set(url, img);
-    return img;
-  }
-
-  /**
-   * Main render method: draws one visualizer frame onto the specified canvas 2D context.
-   */
-  public renderFrame(
-    ctx: CanvasRenderingContext2D,
-    width: number,
-    height: number,
-    analysis: FrequencyAnalysis,
-    config: VisualizerConfig,
-    deltaTimeMs = 16
-  ) {
-    this.totalTimeMs += deltaTimeMs;
-
-    const { cx, cy, minDim } = this.getCenter(config, width, height);
-    const bassWeight = analysis.subBass * 0.7 + analysis.bass * 0.3;
-
-    // Turntable rotation accumulator
-    const rotationSpeed = config.turntableRotationSpeed ?? 1.0;
-    this.vinylRotationAngle += (deltaTimeMs / 1000) * (Math.PI * 0.6) * rotationSpeed;
-
-    // 1. Camera Shake & Bass Zoom calculation
-    let targetShakeX = 0;
-    let targetShakeY = 0;
-    let targetScale = 1.0;
-
-    if (config.bassCameraShake && bassWeight > 0.45) {
-      const shakeMagnitude = (bassWeight - 0.45) * 16 * (minDim / 1000);
-      targetShakeX = (Math.random() - 0.5) * shakeMagnitude;
-      targetShakeY = (Math.random() - 0.5) * shakeMagnitude;
-    }
-
-    if (config.bassZoomIntensity > 0) {
-      targetScale = 1.0 + bassWeight * config.bassZoomIntensity;
-    }
-
-    // Smooth camera interpolation
-    this.shakeX += (targetShakeX - this.shakeX) * 0.25;
-    this.shakeY += (targetShakeY - this.shakeY) * 0.25;
-    this.currentScale += (targetScale - this.currentScale) * 0.2;
-
-    ctx.save();
-    ctx.clearRect(0, 0, width, height);
-
-    // Apply global camera transform centered on visualizer position
-    ctx.translate(cx + this.shakeX, cy + this.shakeY);
-    ctx.scale(this.currentScale, this.currentScale);
-    ctx.translate(-cx, -cy);
-
-    // 2. Render Background Image & Dimming
-    this.renderBackground(ctx, width, height, config, bassWeight);
-
-    // 3. Render Particles with Bass Explosion Impulse
-    this.renderParticles(ctx, width, height, config, analysis, bassWeight);
-
-    // 4. Render Main Audio Visualizer by Selected Layout Style
-    this.renderVisualizerByStyle(ctx, width, height, config, analysis, bassWeight);
-
-    ctx.restore();
-
-    // 5. Render Advanced Video Text Layers (crisp, high-resolution overlays)
-    this.renderTypography(ctx, width, height, config, bassWeight);
-  }
-
-  private renderBackground(
-    ctx: CanvasRenderingContext2D,
-    width: number,
-    height: number,
-    config: VisualizerConfig,
-    bassWeight: number
-  ) {
-    const bgImg = this.getImage(config.backgroundUrl);
-
-    if (bgImg && bgImg.complete && bgImg.naturalWidth > 0) {
-      const hRatio = width / bgImg.naturalWidth;
-      const vRatio = height / bgImg.naturalHeight;
-      const ratio = Math.max(hRatio, vRatio);
-      const drawW = bgImg.naturalWidth * ratio;
-      const drawH = bgImg.naturalHeight * ratio;
-      const drawX = (width - drawW) / 2;
-      const drawY = (height - drawH) / 2;
-
-      ctx.save();
-      if (config.backgroundBlur > 0) {
-        ctx.filter = `blur(${config.backgroundBlur}px)`;
-      }
-      ctx.drawImage(bgImg, drawX, drawY, drawW, drawH);
-      ctx.restore();
-    } else {
-      const grad = ctx.createRadialGradient(width / 2, height / 2, 100, width / 2, height / 2, width);
-      grad.addColorStop(0, '#0f172a');
-      grad.addColorStop(1, '#020617');
-      ctx.fillStyle = grad;
-      ctx.fillRect(0, 0, width, height);
-    }
-
-    // Background Dimming Overlay
-    if (config.backgroundDim > 0) {
-      ctx.fillStyle = `rgba(0, 0, 0, ${Math.min(0.9, config.backgroundDim + bassWeight * 0.05)})`;
-      ctx.fillRect(0, 0, width, height);
-    }
-
-    // Heavy Radial Vignette
-    if (config.backgroundVignette > 0) {
-      const radius = Math.max(width, height) * 0.75;
-      const { cx, cy } = this.getCenter(config, width, height);
-      const vignetteGrad = ctx.createRadialGradient(cx, cy, radius * 0.2, cx, cy, radius);
-      vignetteGrad.addColorStop(0, 'rgba(0,0,0,0)');
-      vignetteGrad.addColorStop(0.7, `rgba(0,0,0,${config.backgroundVignette * 0.5})`);
-      vignetteGrad.addColorStop(1, `rgba(0,0,0,${config.backgroundVignette})`);
-      ctx.fillStyle = vignetteGrad;
-      ctx.fillRect(0, 0, width, height);
-    }
-  }
-
   private renderParticles(
-    ctx: CanvasRenderingContext2D,
+    ctx: Ctx,
     width: number,
     height: number,
     config: VisualizerConfig,
     analysis: FrequencyAnalysis,
-    bassWeight: number
+    pal: Palette,
+    u: number,
+    dt: number,
+    k: number
   ) {
-    if (this.particles.length !== config.particleCount) {
-      this.initParticles(config, width, height);
+    const count = Math.max(0, Math.round(config.particleCount || 0));
+    const key = `${count}|${config.particleDispersion}|${width}x${height}`;
+    if (key !== this.particleKey) {
+      this.particleKey = key;
+      this.particles = Array.from({ length: count }, () => this.spawnParticle(config, width, height, true));
     }
+    if (!count) return;
 
-    const { cx, cy, minDim } = this.getCenter(config, width, height);
-    const dispersion = config.particleDispersion || 'radial';
-    const isParticlesOnly = config.layoutStyle === 'particles-only';
-
-    // Bass impulse multiplier: kicks push particles outward violently
-    const bassPush = analysis.isBeatHit 
-      ? config.particleBassImpact * 1.5 * (minDim / 800)
-      : (bassWeight > 0.4 ? config.particleBassImpact * bassWeight * 0.5 * (minDim / 800) : 0);
+    const { cx, cy } = this.center(config, width, height);
+    const bass = analysis.bassWeight;
+    const impact = config.particleBassImpact * u * 0.22;
+    const push = analysis.isBeatHit ? impact * 6 : bass > 0.35 ? impact * (bass - 0.35) * 2.4 : 0;
+    const mode = config.particleDispersion || 'radial';
+    const sprite = this.sprite(pal.particle, config.particleGlow);
+    const opacity = config.particleOpacity ?? 1;
+    const sizeBoost = 1 + bass * (config.layoutStyle === 'particles-only' ? 1.2 : 0.6);
+    const t = this.timeSec;
 
     ctx.save();
-    if (config.particleGlow) {
-      ctx.shadowBlur = config.glowIntensity * 0.6;
-      ctx.shadowColor = config.particleColor;
-    }
-
-    const timeSec = this.totalTimeMs / 1000;
-
+    ctx.globalCompositeOperation = config.particleGlow ? 'lighter' : 'source-over';
     for (let i = 0; i < this.particles.length; i++) {
       const p = this.particles[i];
-
-      // Update position according to dispersion mode
-      if (dispersion === 'upward') {
-        p.x += p.vx;
-        p.y += p.vy - (analysis.isBeatHit ? bassPush * 0.8 : 0);
-      } else if (dispersion === 'ambient') {
-        p.x += p.vx + Math.sin(timeSec + i) * 0.4;
-        p.y += p.vy + Math.cos(timeSec + i) * 0.4;
+      if (mode === 'upward') {
+        p.x += (p.vx + Math.sin(t * 0.8 + p.phase) * 0.25 * u) * k;
+        p.y += (p.vy - push * 0.6) * k;
+      } else if (mode === 'ambient') {
+        p.x += (p.vx + Math.sin(t * 0.6 + p.phase) * 0.3 * u) * k;
+        p.y += (p.vy + Math.cos(t * 0.5 + p.phase) * 0.3 * u) * k;
+        if (push) {
+          const dx = p.x - cx;
+          const dy = p.y - cy;
+          const d = Math.hypot(dx, dy) || 1;
+          p.x += (dx / d) * push * 0.5 * k;
+          p.y += (dy / d) * push * 0.5 * k;
+        }
       } else {
-        // Radial from center
         const dx = p.x - cx;
         const dy = p.y - cy;
-        const dist = Math.sqrt(dx * dx + dy * dy) || 1;
-        const nx = dx / dist;
-        const ny = dy / dist;
-        p.x += p.vx + nx * bassPush;
-        p.y += p.vy + ny * bassPush;
+        const d = Math.hypot(dx, dy) || 1;
+        p.x += (p.vx + (dx / d) * push) * k;
+        p.y += (p.vy + (dy / d) * push) * k;
       }
+      p.life += dt;
 
-      p.life++;
-
-      // Particle size reacts slightly to bass
-      let renderSize = p.baseSize * (1 + bassWeight * (isParticlesOnly ? 1.0 : 0.6));
-
-      // Sparkle twinkle effect
-      let alpha = p.alpha;
+      let alpha = p.maxAlpha;
+      const fadeIn = Math.min(1, p.life / 0.4);
+      const fadeOut = Math.min(1, (p.maxLife - p.life) / 0.6);
+      alpha *= Math.max(0, Math.min(fadeIn, fadeOut));
+      let size = p.baseSize * sizeBoost;
       if (config.particleSparkle) {
-        alpha *= 0.6 + Math.sin(timeSec * p.twinkleSpeed + i) * 0.4;
-        if (analysis.treble > 0.4) {
-          alpha = Math.min(1.0, alpha * 1.3);
-          renderSize *= 1.2;
-        }
+        alpha *= 0.55 + Math.sin(t * p.twinkle + p.phase) * 0.45;
+        if (analysis.treble > 0.35) size *= 1 + (analysis.treble - 0.35);
+      }
+      alpha *= opacity;
+
+      if (alpha > 0.01) {
+        const s = size * (config.particleGlow ? 7 : 4.8);
+        ctx.globalAlpha = Math.min(1, alpha);
+        ctx.drawImage(sprite, p.x - s / 2, p.y - s / 2, s, s);
       }
 
-      // Fade in and out
-      if (p.life < 20) {
-        alpha = (p.life / 20) * p.maxAlpha;
-      } else if (p.life > p.maxLife - 30) {
-        alpha = ((p.maxLife - p.life) / 30) * p.maxAlpha;
-      }
-
-      // Draw particle
-      ctx.fillStyle = p.color;
-      ctx.globalAlpha = Math.max(0, Math.min(1, alpha * (config.particleOpacity ?? 1)));
-      ctx.beginPath();
-      ctx.arc(p.x, p.y, Math.max(0.5, renderSize), 0, Math.PI * 2);
-      ctx.fill();
-
-      // Recycle if outside boundaries or dead
-      if (
-        p.life >= p.maxLife ||
-        p.x < -100 ||
-        p.x > width + 100 ||
-        p.y < -100 ||
-        p.y > height + 100
-      ) {
-        this.particles[i] = this.createParticle(config, width, height, false);
+      const m = 60 * u;
+      if (p.life >= p.maxLife || p.x < -m || p.x > width + m || p.y < -m || p.y > height + m) {
+        this.particles[i] = this.spawnParticle(config, width, height, false);
       }
     }
-
     ctx.restore();
   }
 
-  /**
-   * Delegates rendering to the chosen visualizer layout style
-   */
-  private renderVisualizerByStyle(
-    ctx: CanvasRenderingContext2D,
+  // ------------------------------------------------------------------ layouts
+
+  private renderByLayout(
+    ctx: Ctx,
     width: number,
     height: number,
     config: VisualizerConfig,
     analysis: FrequencyAnalysis,
-    bassWeight: number
+    pal: Palette,
+    u: number,
+    dt: number
   ) {
-    const layout = config.layoutStyle || 'classic-circle';
-
-    switch (layout) {
+    switch (config.layoutStyle) {
       case 'bottom-bars':
-        this.renderBottomBars(ctx, width, height, config, analysis, bassWeight);
-        break;
+        return this.renderBottomBars(ctx, width, height, config, analysis, pal, u, dt);
       case 'mirror-bars':
-        this.renderMirrorBarsLayout(ctx, width, height, config, analysis, bassWeight);
-        break;
+        return this.renderMirrorBars(ctx, width, height, config, analysis, pal, u);
       case 'horizontal-wave':
-        this.renderHorizontalWave(ctx, width, height, config, analysis, bassWeight);
-        break;
+        return this.renderWave(ctx, width, height, config, analysis, pal, u);
       case 'side-bars':
-        this.renderSideBars(ctx, width, height, config, analysis, bassWeight);
-        break;
+        return this.renderSideBars(ctx, width, height, config, analysis, pal, u);
       case 'full-width':
-        this.renderFullWidth(ctx, width, height, config, analysis, bassWeight);
-        break;
+        return this.renderFullWidth(ctx, width, height, config, analysis, pal, u);
       case 'turntable-vinyl':
-        this.renderTurntableVinyl(ctx, width, height, config, analysis, bassWeight);
-        break;
+        return this.renderVinyl(ctx, width, height, config, analysis, pal, u, dt);
       case 'album-art-pulse':
-        this.renderAlbumArtPulse(ctx, width, height, config, analysis, bassWeight);
-        break;
+        return this.renderAlbumArt(ctx, width, height, config, analysis, pal, u);
       case 'minimal':
-        this.renderMinimalMode(ctx, width, height, config, analysis, bassWeight);
-        break;
+        return this.renderMinimal(ctx, width, height, config, analysis, pal, u);
       case 'particles-only':
-        this.renderParticlesOnlyCore(ctx, width, height, config, analysis, bassWeight);
-        break;
+        return this.renderCore(ctx, width, height, config, analysis, pal, u);
       case 'classic-circle':
       default:
-        this.renderClassicCircle(ctx, width, height, config, analysis, bassWeight);
-        break;
+        return this.renderCircle(ctx, width, height, config, analysis, pal, u, dt);
     }
   }
 
-  /**
-   * Helper: Smooths frequency bins into target size
-   */
-  private getProcessedFrequencies(barCount: number, freqData: Uint8Array, smoothing: number): number[] {
-    if (this.smoothedBars.length !== barCount) {
-      this.smoothedBars = new Array(barCount).fill(0);
-    }
-    const dataLen = freqData.length;
-    for (let i = 0; i < barCount; i++) {
-      const normIdx = i / barCount;
-      const logIdx = Math.pow(normIdx, 1.4);
-      const binIndex = Math.min(dataLen - 1, Math.floor(logIdx * (dataLen * 0.7)));
-      const rawVal = freqData[binIndex] / 255.0;
-      this.smoothedBars[i] = this.smoothedBars[i] * smoothing + rawVal * (1 - smoothing);
-    }
-    return this.smoothedBars;
-  }
-
-  // -------------------------------------------------------------
-  // 1. CERCHIO CENTRALE CLASSICO (Cleaned, No Downward Bleed)
-  // -------------------------------------------------------------
-  private renderClassicCircle(
-    ctx: CanvasRenderingContext2D,
+  // 1. Classic circle ----------------------------------------------------------
+  private renderCircle(
+    ctx: Ctx,
     width: number,
     height: number,
     config: VisualizerConfig,
     analysis: FrequencyAnalysis,
-    bassWeight: number
+    pal: Palette,
+    u: number,
+    dt: number
   ) {
-    const { cx, cy, minDim } = this.getCenter(config, width, height);
-    const baseRadius = minDim * config.innerRadiusRatio;
-    const dynamicRadius = baseRadius * (1 + bassWeight * config.logoPulseIntensity);
+    const { cx, cy, minDim } = this.center(config, width, height);
+    const bass = this.bassSmooth;
+    const radius = minDim * config.innerRadiusRatio * (1 + bass * config.logoPulseIntensity);
+    const count = Math.max(16, Math.round(config.barCount));
+    const spec = this.spectrum(Math.ceil(count / (config.mirrorWave ? 2 : 1)), analysis, config.smoothing);
 
-    const barCount = config.barCount;
-    const bars = this.getProcessedFrequencies(barCount, analysis.frequencyData, config.smoothing);
-    const halfCount = Math.floor(barCount / 2);
+    let maxH = Math.min(height * config.maxBarHeightRatio, minDim * 0.3 * config.barHeightMultiplier);
+    if (config.clampingMode === 'contained') maxH *= 0.6;
+    const scaleU = minDim / 1000;
 
-    // Max bar height clamp (prevents clipping & bleeds)
-    const maxBarHeight = Math.min(
-      height * (config.maxBarHeightRatio || 0.38),
-      minDim * 0.35 * config.barHeightMultiplier
-    );
-
-    ctx.save();
-    if (config.glowIntensity > 0) {
-      ctx.shadowBlur = config.glowIntensity * (minDim / 800);
-      ctx.shadowColor = config.glowColor;
-    }
-
-    const gradient = ctx.createRadialGradient(cx, cy, dynamicRadius, cx, cy, dynamicRadius + maxBarHeight);
-    gradient.addColorStop(0, config.primaryColor);
-    gradient.addColorStop(0.85, config.secondaryColor);
-    gradient.addColorStop(1, '#ffffff');
-    ctx.strokeStyle = gradient;
-    ctx.fillStyle = gradient;
-
-    const angleStep = (Math.PI * 2) / barCount;
-    const startAngle = Math.PI / 2;
-
-    ctx.lineWidth = Math.max(1.5, config.barWidth * (minDim / 800));
-    ctx.lineCap = 'round';
-
-    for (let i = 0; i < barCount; i++) {
-      let mappedIdx = i < halfCount ? i : barCount - 1 - (i - halfCount);
-      if (!config.mirrorWave) mappedIdx = i;
-
-      let barVal = bars[mappedIdx];
-
-      // PREVENTION OF DOWNWARD DEFORMITIES:
-      // If preventDownwardBleed is enabled, taper bars pointing directly downwards
-      const angle = startAngle + i * angleStep;
+    const values = new Float32Array(count);
+    for (let i = 0; i < count; i++) {
+      let v = this.mirrored(spec, i, count, config.mirrorWave);
       if (config.preventDownwardBleed) {
-        // angle near Math.PI / 2 is bottom center
-        const diffFromBottom = Math.abs(((angle % (Math.PI * 2)) + Math.PI * 2) % (Math.PI * 2) - Math.PI / 2);
-        if (diffFromBottom < 0.25) {
-          barVal *= (diffFromBottom / 0.25) * 0.85; // clean bottom curve
-        }
+        // smooth cosine taper around the bottom of the circle (angle = PI/2)
+        const angle = Math.PI / 2 + (i / count) * Math.PI * 2;
+        const diff = Math.abs(Math.atan2(Math.sin(angle - Math.PI / 2), Math.cos(angle - Math.PI / 2)));
+        if (diff < 0.45) v *= 0.15 + 0.85 * (0.5 - 0.5 * Math.cos((diff / 0.45) * Math.PI));
       }
-
-      const heightOffset = Math.max(2, barVal * maxBarHeight);
-      const x1 = cx + Math.cos(angle) * dynamicRadius;
-      const y1 = cy + Math.sin(angle) * dynamicRadius;
-      const x2 = cx + Math.cos(angle) * (dynamicRadius + heightOffset);
-      const y2 = cy + Math.sin(angle) * (dynamicRadius + heightOffset);
-
-      ctx.beginPath();
-      ctx.moveTo(x1, y1);
-      ctx.lineTo(x2, y2);
-      ctx.stroke();
+      values[i] = v;
     }
 
-    ctx.restore();
-
-    // Render central logo
-    this.renderLogo(ctx, width, height, config, bassWeight);
-  }
-
-  // -------------------------------------------------------------
-  // 2. BARRE DAL BASSO (Bottom Equalizer)
-  // -------------------------------------------------------------
-  private renderBottomBars(
-    ctx: CanvasRenderingContext2D,
-    width: number,
-    height: number,
-    config: VisualizerConfig,
-    analysis: FrequencyAnalysis,
-    bassWeight: number
-  ) {
-    const barCount = config.barCount || 80;
-    const bars = this.getProcessedFrequencies(barCount, analysis.frequencyData, config.smoothing);
-    const bottomY = height - (height * ((config.bottomOffsetPercent ?? 8) / 100));
-    const maxHeight = Math.min(height * 0.55, height * (config.maxBarHeightRatio || 0.4) * config.barHeightMultiplier);
-
-    const availableWidth = width * 0.88;
-    const startX = (width - availableWidth) / 2;
-    const spacing = availableWidth / barCount;
-    const barW = Math.max(2, Math.min(spacing * 0.75, config.barWidth * 1.8));
+    const angleAt = (i: number) => Math.PI / 2 + (i / count) * Math.PI * 2;
+    const inward = config.clampingMode === 'symmetric' ? 0.35 : 0;
 
     ctx.save();
-    if (config.glowIntensity > 0) {
-      ctx.shadowBlur = config.glowIntensity;
-      ctx.shadowColor = config.glowColor;
-    }
+    // Faint guide ring
+    ctx.strokeStyle = withAlpha(pal.primary, 0.18);
+    ctx.lineWidth = Math.max(1, 1.5 * scaleU);
+    ctx.beginPath();
+    ctx.arc(cx, cy, radius + 6 * scaleU, 0, Math.PI * 2);
+    ctx.stroke();
 
-    const grad = ctx.createLinearGradient(0, bottomY, 0, bottomY - maxHeight);
-    grad.addColorStop(0, config.secondaryColor);
-    grad.addColorStop(0.7, config.primaryColor);
+    const grad = ctx.createRadialGradient(cx, cy, radius, cx, cy, radius + maxH);
+    grad.addColorStop(0, pal.primary);
+    grad.addColorStop(0.7, pal.secondary);
     grad.addColorStop(1, '#ffffff');
 
-    ctx.fillStyle = grad;
+    const style = config.waveStyle;
+    const lw = Math.max(1, config.barWidth * scaleU * 1.2);
 
-    for (let i = 0; i < barCount; i++) {
-      const val = bars[i];
-      const h = Math.max(4, val * maxHeight);
-      const x = startX + i * spacing + (spacing - barW) / 2;
-      const y = bottomY - h;
-
+    if (style === 'smooth-curve') {
+      const layers: [number, string, number][] = [
+        [1.18, pal.secondary, 0.35],
+        [1.0, pal.primary, 0.9],
+      ];
+      for (const [mult, color, alpha] of layers) {
+        const pts = Array.from({ length: count }, (_, i) => {
+          const a = angleAt(i);
+          const r = radius + 4 * scaleU + values[i] * maxH * mult;
+          return { x: cx + Math.cos(a) * r, y: cy + Math.sin(a) * r };
+        });
+        ctx.beginPath();
+        smoothPath(ctx, pts, true);
+        ctx.fillStyle = withAlpha(color, alpha * 0.25);
+        ctx.fill();
+        this.applyGlow(ctx, config, pal.glow, scaleU);
+        ctx.strokeStyle = withAlpha(color, alpha);
+        ctx.lineWidth = lw;
+        ctx.lineJoin = 'round';
+        ctx.stroke();
+      }
+    } else if (style === 'radial-spikes') {
+      this.applyGlow(ctx, config, pal.glow, scaleU);
       ctx.beginPath();
-      ctx.roundRect(x, y, barW, h, [barW / 2, barW / 2, 0, 0]);
+      for (let i = 0; i < count; i++) {
+        const a0 = angleAt(i);
+        const a1 = angleAt(i + 0.5);
+        const rBase = radius + 4 * scaleU;
+        const rTip = rBase + Math.max(2 * scaleU, values[i] * maxH);
+        if (i === 0) ctx.moveTo(cx + Math.cos(a0) * rBase, cy + Math.sin(a0) * rBase);
+        ctx.lineTo(cx + Math.cos(a1) * rTip, cy + Math.sin(a1) * rTip);
+        const a2 = angleAt(i + 1);
+        ctx.lineTo(cx + Math.cos(a2) * rBase, cy + Math.sin(a2) * rBase);
+      }
+      ctx.closePath();
+      ctx.fillStyle = grad;
+      ctx.globalAlpha = 0.9;
       ctx.fill();
-    }
-
-    ctx.restore();
-  }
-
-  // -------------------------------------------------------------
-  // 3. BARRE SPECCHIATE (Dual Mirrored Center Bars)
-  // -------------------------------------------------------------
-  private renderMirrorBarsLayout(
-    ctx: CanvasRenderingContext2D,
-    width: number,
-    height: number,
-    config: VisualizerConfig,
-    analysis: FrequencyAnalysis,
-    bassWeight: number
-  ) {
-    const barCount = config.barCount || 90;
-    const bars = this.getProcessedFrequencies(barCount, analysis.frequencyData, config.smoothing);
-    const { cy } = this.getCenter(config, width, height);
-    const maxHeight = Math.min(height * 0.35, height * (config.maxBarHeightRatio || 0.3) * config.barHeightMultiplier);
-
-    const availableWidth = width * 0.85;
-    const startX = (width - availableWidth) / 2;
-    const spacing = availableWidth / barCount;
-    const barW = Math.max(2, Math.min(spacing * 0.75, config.barWidth * 1.5));
-
-    ctx.save();
-    if (config.glowIntensity > 0) {
-      ctx.shadowBlur = config.glowIntensity;
-      ctx.shadowColor = config.glowColor;
-    }
-
-    const grad = ctx.createLinearGradient(0, cy - maxHeight, 0, cy + maxHeight);
-    grad.addColorStop(0, config.secondaryColor);
-    grad.addColorStop(0.5, config.primaryColor);
-    grad.addColorStop(1, config.secondaryColor);
-
-    ctx.fillStyle = grad;
-
-    for (let i = 0; i < barCount; i++) {
-      const val = bars[i];
-      const h = Math.max(3, val * maxHeight);
-      const x = startX + i * spacing + (spacing - barW) / 2;
-
-      // Draw top bar & bottom mirrored bar
+      ctx.globalAlpha = 1;
+      ctx.strokeStyle = withAlpha('#ffffff', 0.6);
+      ctx.lineWidth = Math.max(1, scaleU);
+      ctx.stroke();
+    } else if (style === 'dots') {
+      this.applyGlow(ctx, config, pal.glow, scaleU, 0.6);
+      const dot = Math.max(1.2, config.barWidth * scaleU * 0.8);
+      const step = dot * 3;
+      ctx.fillStyle = grad;
+      for (let i = 0; i < count; i++) {
+        const a = angleAt(i);
+        const h = values[i] * maxH;
+        const n = Math.max(1, Math.floor(h / step) + 1);
+        const cos = Math.cos(a);
+        const sin = Math.sin(a);
+        ctx.beginPath();
+        for (let j = 0; j < n; j++) {
+          const r = radius + 8 * scaleU + j * step;
+          ctx.moveTo(cx + cos * r + dot, cy + sin * r);
+          ctx.arc(cx + cos * r, cy + sin * r, dot * (1 - j / (n + 2) * 0.5), 0, Math.PI * 2);
+        }
+        ctx.fill();
+      }
+    } else {
+      // 'bars' and 'mirror-bars' (double ring)
+      ctx.lineCap = 'round';
+      if (style === 'mirror-bars') {
+        ctx.strokeStyle = withAlpha(pal.secondary, 0.45);
+        ctx.lineWidth = lw * 1.6;
+        ctx.beginPath();
+        for (let i = 0; i < count; i++) {
+          const a = angleAt(i + 0.5);
+          const r0 = radius + 6 * scaleU;
+          const r1 = r0 + Math.max(2 * scaleU, values[(i + Math.floor(count / 2)) % count] * maxH * 1.15);
+          ctx.moveTo(cx + Math.cos(a) * r0, cy + Math.sin(a) * r0);
+          ctx.lineTo(cx + Math.cos(a) * r1, cy + Math.sin(a) * r1);
+        }
+        ctx.stroke();
+      }
+      this.applyGlow(ctx, config, pal.glow, scaleU);
+      ctx.strokeStyle = grad;
+      ctx.lineWidth = lw;
       ctx.beginPath();
-      ctx.roundRect(x, cy - h, barW, h * 2, barW / 2);
-      ctx.fill();
-    }
-
-    ctx.restore();
-  }
-
-  // -------------------------------------------------------------
-  // 4. WAVEFORM ORIZZONTALE (Linear Oscilloscope Wave)
-  // -------------------------------------------------------------
-  private renderHorizontalWave(
-    ctx: CanvasRenderingContext2D,
-    width: number,
-    height: number,
-    config: VisualizerConfig,
-    analysis: FrequencyAnalysis,
-    bassWeight: number
-  ) {
-    const pointCount = config.barCount || 120;
-    const bars = this.getProcessedFrequencies(pointCount, analysis.frequencyData, config.smoothing);
-    let baseY = height * 0.6;
-    if (config.waveVerticalPosition === 'top') baseY = height * 0.25;
-    else if (config.waveVerticalPosition === 'center') baseY = height * 0.5;
-    else if (config.waveVerticalPosition === 'bottom') baseY = height * 0.8;
-
-    const maxHeight = Math.min(height * 0.35, height * 0.25 * config.barHeightMultiplier);
-    const stepX = width / (pointCount - 1);
-
-    ctx.save();
-    if (config.glowIntensity > 0) {
-      ctx.shadowBlur = config.glowIntensity * 1.2;
-      ctx.shadowColor = config.glowColor;
-    }
-
-    ctx.strokeStyle = config.primaryColor;
-    ctx.lineWidth = Math.max(2, config.barWidth * 1.2);
-    ctx.lineCap = 'round';
-
-    ctx.beginPath();
-    ctx.moveTo(0, baseY);
-
-    for (let i = 0; i < pointCount; i++) {
-      const sign = i % 2 === 0 ? 1 : -1;
-      const val = bars[i];
-      const x = i * stepX;
-      const y = baseY + sign * val * maxHeight;
-      ctx.lineTo(x, y);
-    }
-
-    ctx.stroke();
-
-    // Subtle glowing fill underneath
-    ctx.lineTo(width, height);
-    ctx.lineTo(0, height);
-    ctx.closePath();
-    ctx.fillStyle = config.secondaryColor;
-    ctx.globalAlpha = 0.08;
-    ctx.fill();
-
-    ctx.restore();
-  }
-
-  // -------------------------------------------------------------
-  // 5. BARRE LATERALI (Side Studio Bars)
-  // -------------------------------------------------------------
-  private renderSideBars(
-    ctx: CanvasRenderingContext2D,
-    width: number,
-    height: number,
-    config: VisualizerConfig,
-    analysis: FrequencyAnalysis,
-    bassWeight: number
-  ) {
-    const barCount = Math.floor((config.barCount || 60) / 2);
-    const bars = this.getProcessedFrequencies(barCount * 2, analysis.frequencyData, config.smoothing);
-    const maxBarW = Math.min(width * 0.25, width * 0.2 * config.barHeightMultiplier);
-    const availableH = height * 0.75;
-    const startY = (height - availableH) / 2;
-    const spacing = availableH / barCount;
-    const barH = Math.max(2, spacing * 0.65);
-
-    ctx.save();
-    if (config.glowIntensity > 0) {
-      ctx.shadowBlur = config.glowIntensity;
-      ctx.shadowColor = config.glowColor;
-    }
-
-    ctx.fillStyle = config.primaryColor;
-
-    for (let i = 0; i < barCount; i++) {
-      const valL = bars[i];
-      const valR = bars[barCount + i];
-      const wL = Math.max(4, valL * maxBarW);
-      const wR = Math.max(4, valR * maxBarW);
-      const y = startY + i * spacing;
-
-      // Left bar coming inward
-      ctx.beginPath();
-      ctx.roundRect(0, y, wL, barH, [0, barH / 2, barH / 2, 0]);
-      ctx.fill();
-
-      // Right bar coming inward
-      ctx.beginPath();
-      ctx.roundRect(width - wR, y, wR, barH, [barH / 2, 0, 0, barH / 2]);
-      ctx.fill();
-    }
-
-    ctx.restore();
-  }
-
-  // -------------------------------------------------------------
-  // 6. VISUALIZZATORE FULL WIDTH (Expansive Horizon Wave)
-  // -------------------------------------------------------------
-  private renderFullWidth(
-    ctx: CanvasRenderingContext2D,
-    width: number,
-    height: number,
-    config: VisualizerConfig,
-    analysis: FrequencyAnalysis,
-    bassWeight: number
-  ) {
-    const barCount = config.barCount || 100;
-    const bars = this.getProcessedFrequencies(barCount, analysis.frequencyData, config.smoothing);
-    const baseY = height - (height * ((config.bottomOffsetPercent ?? 6) / 100));
-    const maxHeight = Math.min(height * 0.45, height * 0.35 * config.barHeightMultiplier);
-    const stepX = width / (barCount - 1);
-
-    ctx.save();
-    if (config.glowIntensity > 0) {
-      ctx.shadowBlur = config.glowIntensity * 1.5;
-      ctx.shadowColor = config.glowColor;
-    }
-
-    // Draw liquid smooth spline across full width
-    const points: { x: number; y: number }[] = [];
-    for (let i = 0; i < barCount; i++) {
-      const val = bars[i];
-      points.push({
-        x: i * stepX,
-        y: baseY - val * maxHeight,
-      });
-    }
-
-    ctx.beginPath();
-    ctx.moveTo(points[0].x, points[0].y);
-    for (let i = 0; i < points.length - 1; i++) {
-      const mx = (points[i].x + points[i + 1].x) / 2;
-      const my = (points[i].y + points[i + 1].y) / 2;
-      ctx.quadraticCurveTo(points[i].x, points[i].y, mx, my);
-    }
-    ctx.lineTo(width, baseY);
-    ctx.lineTo(width, height);
-    ctx.lineTo(0, height);
-    ctx.closePath();
-
-    const grad = ctx.createLinearGradient(0, baseY - maxHeight, 0, height);
-    grad.addColorStop(0, config.primaryColor);
-    grad.addColorStop(0.5, config.secondaryColor);
-    grad.addColorStop(1, 'rgba(0,0,0,0.85)');
-
-    ctx.fillStyle = grad;
-    ctx.globalAlpha = 0.85;
-    ctx.fill();
-
-    ctx.strokeStyle = '#ffffff';
-    ctx.lineWidth = Math.max(2, config.barWidth);
-    ctx.globalAlpha = 1.0;
-    ctx.stroke();
-
-    ctx.restore();
-  }
-
-  // -------------------------------------------------------------
-  // 7. MODALITÀ GIRADISCHI (Vinyl Record Turntable)
-  // -------------------------------------------------------------
-  private renderTurntableVinyl(
-    ctx: CanvasRenderingContext2D,
-    width: number,
-    height: number,
-    config: VisualizerConfig,
-    analysis: FrequencyAnalysis,
-    bassWeight: number
-  ) {
-    const { cx, cy, minDim } = this.getCenter(config, width, height);
-    const vinylRadius = minDim * (config.innerRadiusRatio + 0.12) * (1 + bassWeight * 0.08);
-
-    ctx.save();
-
-    // 1. Vinyl Ambient Drop Shadow
-    ctx.shadowBlur = 35;
-    ctx.shadowColor = 'rgba(0,0,0,0.9)';
-    ctx.beginPath();
-    ctx.arc(cx, cy, vinylRadius, 0, Math.PI * 2);
-    ctx.fillStyle = '#08090d';
-    ctx.fill();
-
-    // 2. Vinyl Grooves (Realistic concentric circles with audio reactive sheen)
-    ctx.shadowBlur = 0;
-    for (let r = vinylRadius * 0.45; r < vinylRadius * 0.95; r += 5) {
-      ctx.beginPath();
-      ctx.arc(cx, cy, r, 0, Math.PI * 2);
-      ctx.strokeStyle = r % 10 === 0 ? 'rgba(255,255,255,0.08)' : 'rgba(0,0,0,0.6)';
-      ctx.lineWidth = 1;
+      for (let i = 0; i < count; i++) {
+        const a = angleAt(i);
+        const h = Math.max(2 * scaleU, values[i] * maxH);
+        const r0 = radius + 6 * scaleU - h * inward;
+        const r1 = radius + 6 * scaleU + h;
+        ctx.moveTo(cx + Math.cos(a) * r0, cy + Math.sin(a) * r0);
+        ctx.lineTo(cx + Math.cos(a) * r1, cy + Math.sin(a) * r1);
+      }
       ctx.stroke();
     }
+    ctx.restore();
 
-    // 3. Rotating Stylus Specular Sheen (Vinyl Light Reflection)
+    this.renderLogo(ctx, cx, cy, radius, config, pal, scaleU, dt);
+  }
+
+  private renderLogo(
+    ctx: Ctx,
+    cx: number,
+    cy: number,
+    radius: number,
+    config: VisualizerConfig,
+    pal: Palette,
+    scaleU: number,
+    dt: number
+  ) {
+    if (config.logoSpin) this.logoAngle += dt * 0.6;
+    const img = this.getImage(config.logoUrl);
+    const shape = config.logoShape;
+    const pathFor = (r: number) => {
+      if (shape === 'rounded-square') {
+        const s = r * 1.8;
+        ctx.beginPath();
+        ctx.roundRect(-s / 2, -s / 2, s, s, s * 0.22);
+      } else if (shape === 'hexagon') {
+        hexPath(ctx, 0, 0, r * 1.05);
+      } else {
+        ctx.beginPath();
+        ctx.arc(0, 0, r, 0, Math.PI * 2);
+      }
+    };
+
     ctx.save();
     ctx.translate(cx, cy);
-    ctx.rotate(this.vinylRotationAngle);
+    ctx.rotate(config.logoSpin ? this.logoAngle : 0);
 
-    const sheenGrad = ctx.createLinearGradient(-vinylRadius, -vinylRadius, vinylRadius, vinylRadius);
-    sheenGrad.addColorStop(0, 'rgba(255,255,255,0.06)');
-    sheenGrad.addColorStop(0.5, 'rgba(255,255,255,0)');
-    sheenGrad.addColorStop(1, 'rgba(255,255,255,0.06)');
-    ctx.fillStyle = sheenGrad;
-    ctx.beginPath();
-    ctx.arc(0, 0, vinylRadius, 0, Math.PI * 2);
+    const inner = shape === 'ring' ? radius * 0.82 : radius;
+    // Base disc with soft glow
+    this.applyGlow(ctx, config, pal.glow, scaleU, 1.2);
+    pathFor(inner);
+    ctx.fillStyle = '#07070b';
     ctx.fill();
+    ctx.shadowBlur = 0;
 
-    // 4. Center Label & Logo
-    const labelRadius = vinylRadius * 0.38;
-    ctx.beginPath();
-    ctx.arc(0, 0, labelRadius, 0, Math.PI * 2);
-    ctx.fillStyle = config.primaryColor;
-    ctx.fill();
-
-    // Logo image in center label
-    const logoImg = this.getImage(config.logoUrl);
-    if (logoImg && logoImg.complete && logoImg.naturalWidth > 0) {
+    if (img) {
       ctx.save();
-      ctx.beginPath();
-      ctx.arc(0, 0, labelRadius * 0.85, 0, Math.PI * 2);
+      pathFor(inner);
       ctx.clip();
-      ctx.drawImage(logoImg, -labelRadius * 0.85, -labelRadius * 0.85, labelRadius * 1.7, labelRadius * 1.7);
-      ctx.restore();
-    }
-
-    // Center Spindle Hole
-    ctx.beginPath();
-    ctx.arc(0, 0, labelRadius * 0.12, 0, Math.PI * 2);
-    ctx.fillStyle = '#05070a';
-    ctx.fill();
-    ctx.strokeStyle = '#94a3b8';
-    ctx.lineWidth = 1.5;
-    ctx.stroke();
-
-    ctx.restore();
-
-    // 5. Outer Audio Reactive Rim Glow & Sparks
-    if (config.turntableGrooveGlow) {
-      ctx.shadowBlur = config.glowIntensity * 1.2;
-      ctx.shadowColor = config.glowColor;
-      ctx.strokeStyle = config.glowColor;
-      ctx.lineWidth = Math.max(2, 2 + bassWeight * 5);
-      ctx.beginPath();
-      ctx.arc(cx, cy, vinylRadius + 2, 0, Math.PI * 2);
-      ctx.stroke();
-    }
-
-    ctx.restore();
-  }
-
-  // -------------------------------------------------------------
-  // 8. MODALITÀ ALBUM ART PULSE (Modern Floating Card)
-  // -------------------------------------------------------------
-  private renderAlbumArtPulse(
-    ctx: CanvasRenderingContext2D,
-    width: number,
-    height: number,
-    config: VisualizerConfig,
-    analysis: FrequencyAnalysis,
-    bassWeight: number
-  ) {
-    const { cx, cy, minDim } = this.getCenter(config, width, height);
-    const pulseBoost = 1.0 + bassWeight * (config.logoPulseIntensity || 0.25);
-    const cardSize = minDim * 0.52 * pulseBoost;
-    const radius = 16 * (minDim / 800);
-
-    ctx.save();
-
-    // Heavy Drop Shadow
-    ctx.shadowBlur = 40 + bassWeight * 20;
-    ctx.shadowColor = config.glowColor;
-
-    // Glowing rim
-    ctx.strokeStyle = config.primaryColor;
-    ctx.lineWidth = Math.max(3, 4 * (minDim / 800));
-
-    const x = cx - cardSize / 2;
-    const y = cy - cardSize / 2;
-
-    ctx.beginPath();
-    ctx.roundRect(x, y, cardSize, cardSize, radius);
-    ctx.stroke();
-
-    // Image Fill
-    ctx.save();
-    ctx.clip();
-    const logoImg = this.getImage(config.logoUrl);
-    if (logoImg && logoImg.complete && logoImg.naturalWidth > 0) {
-      ctx.drawImage(logoImg, x, y, cardSize, cardSize);
-    } else {
-      ctx.fillStyle = '#090d16';
-      ctx.fillRect(x, y, cardSize, cardSize);
-    }
-    ctx.restore();
-
-    ctx.restore();
-  }
-
-  // -------------------------------------------------------------
-  // 9. MODALITÀ MINIMAL (Refined Discreet Dots / Thin Line)
-  // -------------------------------------------------------------
-  private renderMinimalMode(
-    ctx: CanvasRenderingContext2D,
-    width: number,
-    height: number,
-    config: VisualizerConfig,
-    analysis: FrequencyAnalysis,
-    bassWeight: number
-  ) {
-    const { cx, cy, minDim } = this.getCenter(config, width, height);
-    const count = 48;
-    const bars = this.getProcessedFrequencies(count, analysis.frequencyData, 0.9);
-    const r = minDim * 0.22;
-
-    ctx.save();
-    ctx.fillStyle = config.primaryColor;
-    if (config.glowIntensity > 0) {
-      ctx.shadowBlur = 10;
-      ctx.shadowColor = config.glowColor;
-    }
-
-    const angleStep = (Math.PI * 2) / count;
-    for (let i = 0; i < count; i++) {
-      const a = i * angleStep;
-      const dist = r + bars[i] * (minDim * 0.08);
-      const px = cx + Math.cos(a) * dist;
-      const py = cy + Math.sin(a) * dist;
-
-      ctx.beginPath();
-      ctx.arc(px, py, 2, 0, Math.PI * 2);
-      ctx.fill();
-    }
-    ctx.restore();
-  }
-
-  // -------------------------------------------------------------
-  // 10. MODALITÀ SOLO PARTICELLE (No Bars, Pure Energy Core)
-  // -------------------------------------------------------------
-  private renderParticlesOnlyCore(
-    ctx: CanvasRenderingContext2D,
-    width: number,
-    height: number,
-    config: VisualizerConfig,
-    analysis: FrequencyAnalysis,
-    bassWeight: number
-  ) {
-    const { cx, cy, minDim } = this.getCenter(config, width, height);
-    const coreRadius = minDim * 0.12 * (1 + bassWeight * 0.35);
-
-    ctx.save();
-    ctx.shadowBlur = config.glowIntensity * 2;
-    ctx.shadowColor = config.glowColor;
-
-    const coreGrad = ctx.createRadialGradient(cx, cy, 0, cx, cy, coreRadius);
-    coreGrad.addColorStop(0, '#ffffff');
-    coreGrad.addColorStop(0.4, config.primaryColor);
-    coreGrad.addColorStop(1, 'rgba(0,0,0,0)');
-
-    ctx.fillStyle = coreGrad;
-    ctx.beginPath();
-    ctx.arc(cx, cy, coreRadius, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.restore();
-  }
-
-  // Central Logo Helper (for circular mode)
-  private renderLogo(
-    ctx: CanvasRenderingContext2D,
-    width: number,
-    height: number,
-    config: VisualizerConfig,
-    bassWeight: number
-  ) {
-    const { cx, cy, minDim } = this.getCenter(config, width, height);
-    const baseRadius = minDim * config.innerRadiusRatio;
-    const dynamicRadius = baseRadius * (1 + bassWeight * config.logoPulseIntensity);
-
-    ctx.save();
-    ctx.beginPath();
-    if (config.logoShape === 'rounded-square') {
-      const size = dynamicRadius * 1.8;
-      const r = dynamicRadius * 0.35;
-      ctx.roundRect(cx - size / 2, cy - size / 2, size, size, r);
-    } else {
-      ctx.arc(cx, cy, dynamicRadius, 0, Math.PI * 2);
-    }
-    ctx.fillStyle = '#05070d';
-    ctx.fill();
-
-    const logoImg = this.getImage(config.logoUrl);
-    if (logoImg && logoImg.complete && logoImg.naturalWidth > 0) {
-      ctx.save();
-      ctx.clip();
-      ctx.drawImage(logoImg, cx - dynamicRadius, cy - dynamicRadius, dynamicRadius * 2, dynamicRadius * 2);
+      drawImageCover(ctx, img, -inner, -inner, inner * 2, inner * 2);
+      // inner shading for depth
+      const shade = ctx.createRadialGradient(0, -inner * 0.3, inner * 0.2, 0, 0, inner);
+      shade.addColorStop(0, 'rgba(255,255,255,0.06)');
+      shade.addColorStop(1, 'rgba(0,0,0,0.35)');
+      ctx.fillStyle = shade;
+      ctx.fillRect(-inner, -inner, inner * 2, inner * 2);
       ctx.restore();
     }
 
     if (config.logoBorderWidth > 0) {
-      ctx.shadowBlur = config.glowIntensity * 1.2;
-      ctx.shadowColor = config.logoBorderColor;
-      ctx.strokeStyle = config.logoBorderColor;
-      ctx.lineWidth = Math.max(2, config.logoBorderWidth * (minDim / 800));
-      ctx.beginPath();
-      ctx.arc(cx, cy, dynamicRadius, 0, Math.PI * 2);
+      const bw = Math.max(1, config.logoBorderWidth * scaleU * 1.3);
+      this.applyGlow(ctx, config, pal.logoBorder, scaleU, 0.8);
+      ctx.strokeStyle = pal.logoBorder;
+      ctx.lineWidth = bw;
+      pathFor(inner);
       ctx.stroke();
+      if (shape === 'ring') {
+        ctx.lineWidth = bw * 0.6;
+        ctx.globalAlpha = 0.7;
+        ctx.beginPath();
+        ctx.arc(0, 0, radius, 0, Math.PI * 2);
+        ctx.stroke();
+        ctx.globalAlpha = 1;
+      }
     }
     ctx.restore();
   }
 
-  /**
-   * Renders dedicated advanced text layers with custom positioning,
-   * fonts, weights, alignments, animations, glows, and background boxes.
-   */
-  private renderTypography(
-    ctx: CanvasRenderingContext2D,
+  // 2. Bottom equaliser --------------------------------------------------------
+  private renderBottomBars(
+    ctx: Ctx,
     width: number,
     height: number,
     config: VisualizerConfig,
-    bassWeight: number
+    analysis: FrequencyAnalysis,
+    pal: Palette,
+    u: number,
+    dt: number
   ) {
-    const scaleRatio = height / 1080;
-    const timeSec = this.totalTimeMs / 1000;
-    const layers: TextLayer[] = config.textLayers || [];
+    const count = Math.max(8, Math.round(config.barCount));
+    const spec = this.spectrum(count, analysis, config.smoothing);
+    const peaks = this.peaks(spec, dt);
+    const scale = config.visualizerScale ?? 1;
+    const baseY = height * (1 - (config.bottomOffsetPercent ?? 10) / 100);
+    const maxH = Math.min(baseY * 0.92, height * config.maxBarHeightRatio * config.barHeightMultiplier * 1.2 * scale);
+    const avail = width * Math.min(0.96, 0.86 * scale);
+    const startX = ((config.visualizerX ?? 50) / 100) * width - avail / 2;
+    const spacing = avail / count;
+    const barW = Math.max(1, Math.min(spacing * 0.78, config.barWidth * u * 2.2));
+    const led = config.waveStyle === 'dots';
 
-    for (const layer of layers) {
-      if (!layer.enabled || !layer.text || !layer.text.trim()) continue;
+    const grad = ctx.createLinearGradient(0, baseY, 0, baseY - maxH);
+    grad.addColorStop(0, pal.secondary);
+    grad.addColorStop(0.65, pal.primary);
+    grad.addColorStop(1, '#ffffff');
 
-      ctx.save();
-
-      let tx = (layer.x / 100) * width;
-      let ty = (layer.y / 100) * height;
-
-      const scaledFontSize = Math.max(10, Math.round(layer.fontSize * scaleRatio));
-      const textContent = layer.isUppercase ? layer.text.toUpperCase() : layer.text;
-
-      const italicStr = layer.isItalic ? 'italic' : 'normal';
-      const weightStr = layer.fontWeight || '700';
-      const familyStr = layer.fontFamily || 'Outfit';
-      ctx.font = `${italicStr} ${weightStr} ${scaledFontSize}px '${familyStr}', sans-serif`;
-
-      // Animation & Audio reactivity transforms
-      let textPulse = 1.0;
-      if (layer.animation === 'bass-pulse') {
-        textPulse = 1.0 + bassWeight * (layer.audioReactivity !== undefined ? layer.audioReactivity : 0.2);
-      } else if (layer.animation === 'gentle-float') {
-        ty += Math.sin(timeSec * 2.2) * 5 * scaleRatio;
-      }
-
-      ctx.translate(tx, ty);
-      if (textPulse !== 1.0) {
-        ctx.scale(textPulse, textPulse);
-      }
-
-      if (layer.letterSpacing) {
-        try {
-          (ctx as unknown as { letterSpacing: string }).letterSpacing = `${layer.letterSpacing * scaleRatio}px`;
-        } catch {
-          // Fallback
+    const drawBars = (alphaMul: number) => {
+      ctx.fillStyle = grad;
+      ctx.globalAlpha = alphaMul;
+      ctx.beginPath();
+      for (let i = 0; i < count; i++) {
+        const h = Math.max(3 * u, spec[i] * maxH);
+        const x = startX + i * spacing + (spacing - barW) / 2;
+        if (led) {
+          const seg = barW * 0.7;
+          const gap = seg * 0.45;
+          for (let y = 0; y < h; y += seg + gap) ctx.rect(x, baseY - y - seg, barW, seg);
+        } else {
+          ctx.roundRect(x, baseY - h, barW, h, [barW / 2, barW / 2, 0, 0]);
         }
       }
+      ctx.fill();
+    };
 
+    ctx.save();
+    this.applyGlow(ctx, config, pal.glow, u);
+    drawBars(1);
+    ctx.shadowBlur = 0;
+
+    // Peak caps
+    ctx.fillStyle = '#ffffff';
+    ctx.globalAlpha = 0.85;
+    ctx.beginPath();
+    for (let i = 0; i < count; i++) {
+      const x = startX + i * spacing + (spacing - barW) / 2;
+      const y = baseY - Math.max(3 * u, peaks[i] * maxH) - 6 * u;
+      ctx.rect(x, y, barW, Math.max(1, 2.2 * u));
+    }
+    ctx.fill();
+
+    // Reflection
+    const reflH = height - baseY;
+    if (reflH > 8 * u) {
+      ctx.save();
+      ctx.beginPath();
+      ctx.rect(0, baseY + 2 * u, width, reflH);
+      ctx.clip();
+      ctx.translate(0, baseY * 2 + 4 * u);
+      ctx.scale(1, -1);
+      drawBars(0.22);
+      ctx.restore();
+      const fade = ctx.createLinearGradient(0, baseY, 0, height);
+      fade.addColorStop(0, 'rgba(0,0,0,0)');
+      fade.addColorStop(1, 'rgba(0,0,0,0.85)');
+      ctx.globalAlpha = 1;
+      ctx.fillStyle = fade;
+      ctx.fillRect(0, baseY, width, reflH);
+    }
+
+    // Base line
+    ctx.globalAlpha = 0.6;
+    ctx.fillStyle = pal.primary;
+    ctx.fillRect(startX, baseY + 1 * u, avail, Math.max(1, 1.5 * u));
+    ctx.restore();
+  }
+
+  // 3. Mirror bars --------------------------------------------------------------
+  private renderMirrorBars(
+    ctx: Ctx,
+    width: number,
+    height: number,
+    config: VisualizerConfig,
+    analysis: FrequencyAnalysis,
+    pal: Palette,
+    u: number
+  ) {
+    const count = Math.max(8, Math.round(config.barCount));
+    const spec = this.spectrum(Math.ceil(count / (config.mirrorWave ? 2 : 1)), analysis, config.smoothing);
+    const { cy, scale } = this.center(config, width, height);
+    const cx = ((config.visualizerX ?? 50) / 100) * width;
+    const maxH = Math.min(height * 0.42, height * config.maxBarHeightRatio * config.barHeightMultiplier * scale);
+    const avail = width * Math.min(0.96, 0.84 * scale);
+    const startX = cx - avail / 2;
+    const spacing = avail / count;
+    const barW = Math.max(1, Math.min(spacing * 0.72, config.barWidth * u * 2));
+
+    const grad = ctx.createLinearGradient(0, cy - maxH, 0, cy + maxH);
+    grad.addColorStop(0, '#ffffff');
+    grad.addColorStop(0.2, pal.secondary);
+    grad.addColorStop(0.5, pal.primary);
+    grad.addColorStop(0.8, pal.secondary);
+    grad.addColorStop(1, '#ffffff');
+
+    ctx.save();
+    this.applyGlow(ctx, config, pal.glow, u);
+    ctx.fillStyle = grad;
+    ctx.beginPath();
+    for (let i = 0; i < count; i++) {
+      // lows in the middle when mirrored
+      let v: number;
+      if (config.mirrorWave) {
+        const half = count / 2;
+        const d = Math.abs(i + 0.5 - half) / half;
+        v = spec[Math.min(spec.length - 1, Math.floor(d * spec.length))];
+      } else {
+        v = spec[Math.floor((i / count) * spec.length)];
+      }
+      const h = Math.max(2 * u, v * maxH);
+      const x = startX + i * spacing + (spacing - barW) / 2;
+      ctx.roundRect(x, cy - h, barW, h * 2, barW / 2);
+    }
+    ctx.fill();
+    ctx.shadowBlur = 0;
+    ctx.fillStyle = withAlpha('#ffffff', 0.5);
+    ctx.fillRect(startX, cy - 0.75 * u, avail, Math.max(1, 1.5 * u));
+    ctx.restore();
+  }
+
+  // 4. Oscilloscope wave --------------------------------------------------------
+  private renderWave(
+    ctx: Ctx,
+    width: number,
+    height: number,
+    config: VisualizerConfig,
+    analysis: FrequencyAnalysis,
+    pal: Palette,
+    u: number
+  ) {
+    const pos = config.waveVerticalPosition;
+    const baseY =
+      pos === 'top' ? height * 0.28 : pos === 'bottom' ? height * 0.74 : ((config.visualizerY ?? 50) / 100) * height;
+    const scale = config.visualizerScale ?? 1;
+    const amp = height * 0.22 * config.barHeightMultiplier * scale;
+    const points = Math.max(32, Math.round(config.barCount));
+    const td = analysis.timeDomainData;
+    const n = td.length;
+    // Use a zero-crossing trigger to keep the waveform stable (like a real oscilloscope)
+    let trigger = 0;
+    for (let i = 1; i < n / 2; i++) {
+      if (td[i - 1] < 128 && td[i] >= 128) {
+        trigger = i;
+        break;
+      }
+    }
+    const span = Math.floor(n / 2);
+    const sample = (t: number) => {
+      const idx = trigger + Math.floor(t * (span - 1));
+      return (td[Math.min(n - 1, idx)] - 128) / 128;
+    };
+    const margin = width * (1 - Math.min(1, 0.92 * scale)) / 2;
+    const w = width - margin * 2;
+
+    const build = (ampMul: number, phase: number) =>
+      Array.from({ length: points }, (_, i) => {
+        const t = i / (points - 1);
+        const env = Math.sin(t * Math.PI); // taper ends
+        const v = sample(Math.min(1, t + phase));
+        return { x: margin + t * w, y: baseY + v * amp * ampMul * (0.25 + env * 0.75) };
+      });
+
+    ctx.save();
+    ctx.lineJoin = 'round';
+    ctx.lineCap = 'round';
+    const lw = Math.max(1, config.barWidth * u * 1.1);
+
+    // Filled ghost layer
+    const ghost = build(1.35, 0.03);
+    ctx.beginPath();
+    smoothPath(ctx, ghost, false);
+    ctx.lineTo(margin + w, baseY);
+    ctx.lineTo(margin, baseY);
+    ctx.closePath();
+    const fill = ctx.createLinearGradient(0, baseY - amp, 0, baseY + amp);
+    fill.addColorStop(0, withAlpha(pal.secondary, 0.25));
+    fill.addColorStop(0.5, withAlpha(pal.secondary, 0.05));
+    fill.addColorStop(1, withAlpha(pal.secondary, 0.25));
+    ctx.fillStyle = fill;
+    ctx.fill();
+
+    const lineGrad = ctx.createLinearGradient(margin, 0, margin + w, 0);
+    lineGrad.addColorStop(0, withAlpha(pal.secondary, 0));
+    lineGrad.addColorStop(0.15, pal.secondary);
+    lineGrad.addColorStop(0.5, pal.primary);
+    lineGrad.addColorStop(0.85, pal.secondary);
+    lineGrad.addColorStop(1, withAlpha(pal.secondary, 0));
+
+    this.applyGlow(ctx, config, pal.glow, u, 1.2);
+    ctx.strokeStyle = lineGrad;
+    ctx.lineWidth = lw * 2.2;
+    ctx.globalAlpha = 0.45;
+    ctx.beginPath();
+    smoothPath(ctx, ghost, false);
+    ctx.stroke();
+
+    ctx.globalAlpha = 1;
+    ctx.lineWidth = lw;
+    ctx.beginPath();
+    smoothPath(ctx, build(1, 0), false);
+    ctx.stroke();
+
+    ctx.shadowBlur = 0;
+    ctx.strokeStyle = withAlpha('#ffffff', 0.85);
+    ctx.lineWidth = Math.max(0.75, lw * 0.35);
+    ctx.beginPath();
+    smoothPath(ctx, build(1, 0), false);
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  // 5. Side bars ----------------------------------------------------------------
+  private renderSideBars(
+    ctx: Ctx,
+    width: number,
+    height: number,
+    config: VisualizerConfig,
+    analysis: FrequencyAnalysis,
+    pal: Palette,
+    u: number
+  ) {
+    const rows = Math.max(8, Math.round(config.barCount / 2));
+    const spec = this.spectrum(Math.ceil(rows / 2), analysis, config.smoothing);
+    const scale = config.visualizerScale ?? 1;
+    const maxW = width * 0.22 * config.barHeightMultiplier * scale;
+    const availH = height * Math.min(0.94, 0.8 * scale);
+    const startY = ((config.visualizerY ?? 50) / 100) * height - availH / 2;
+    const spacing = availH / rows;
+    const barH = Math.max(1, Math.min(spacing * 0.7, config.barWidth * u * 1.8));
+
+    ctx.save();
+    this.applyGlow(ctx, config, pal.glow, u);
+    for (const side of [0, 1]) {
+      const grad = side === 0 ? ctx.createLinearGradient(0, 0, maxW, 0) : ctx.createLinearGradient(width, 0, width - maxW, 0);
+      grad.addColorStop(0, pal.secondary);
+      grad.addColorStop(0.7, pal.primary);
+      grad.addColorStop(1, '#ffffff');
+      ctx.fillStyle = grad;
+      ctx.beginPath();
+      for (let i = 0; i < rows; i++) {
+        const half = rows / 2;
+        const d = Math.abs(i + 0.5 - half) / half; // lows at vertical centre
+        const v = spec[Math.min(spec.length - 1, Math.floor(d * spec.length))];
+        const w = Math.max(3 * u, v * maxW);
+        const y = startY + i * spacing + (spacing - barH) / 2;
+        if (side === 0) ctx.roundRect(0, y, w, barH, [0, barH / 2, barH / 2, 0]);
+        else ctx.roundRect(width - w, y, w, barH, [barH / 2, 0, 0, barH / 2]);
+      }
+      ctx.fill();
+    }
+    ctx.restore();
+  }
+
+  // 6. Full width horizon ---------------------------------------------------------
+  private renderFullWidth(
+    ctx: Ctx,
+    width: number,
+    height: number,
+    config: VisualizerConfig,
+    analysis: FrequencyAnalysis,
+    pal: Palette,
+    u: number
+  ) {
+    const count = Math.max(16, Math.round(config.barCount));
+    const spec = this.spectrum(count, analysis, config.smoothing);
+    const scale = config.visualizerScale ?? 1;
+    const baseY = height * (1 - (config.bottomOffsetPercent ?? 0) / 100);
+    const maxH = Math.min(baseY * 0.9, height * 0.38 * config.barHeightMultiplier * scale);
+
+    const layer = (mult: number, shift: number) => {
+      const pts = [{ x: -10 * u, y: baseY }];
+      for (let i = 0; i < count; i++) {
+        const t = i / (count - 1);
+        const idx = Math.min(count - 1, Math.max(0, i + shift));
+        const env = 0.35 + 0.65 * Math.sin(Math.min(1, t * 1.05) * Math.PI * 0.5 + 0.25);
+        pts.push({ x: t * width, y: baseY - spec[idx] * maxH * mult * env });
+      }
+      pts.push({ x: width + 10 * u, y: baseY });
+      return pts;
+    };
+
+    ctx.save();
+    const back = layer(1.25, 3);
+    ctx.beginPath();
+    smoothPath(ctx, back, false);
+    ctx.lineTo(width + 10 * u, height + 10 * u);
+    ctx.lineTo(-10 * u, height + 10 * u);
+    ctx.closePath();
+    const g1 = ctx.createLinearGradient(0, baseY - maxH * 1.25, 0, baseY);
+    g1.addColorStop(0, withAlpha(pal.secondary, 0.55));
+    g1.addColorStop(1, withAlpha(pal.secondary, 0.05));
+    ctx.fillStyle = g1;
+    ctx.fill();
+
+    const front = layer(1, 0);
+    ctx.beginPath();
+    smoothPath(ctx, front, false);
+    ctx.lineTo(width + 10 * u, height + 10 * u);
+    ctx.lineTo(-10 * u, height + 10 * u);
+    ctx.closePath();
+    const g2 = ctx.createLinearGradient(0, baseY - maxH, 0, baseY);
+    g2.addColorStop(0, withAlpha(pal.primary, 0.9));
+    g2.addColorStop(0.6, withAlpha(pal.secondary, 0.45));
+    g2.addColorStop(1, 'rgba(0,0,0,0.6)');
+    ctx.fillStyle = g2;
+    ctx.fill();
+
+    this.applyGlow(ctx, config, pal.glow, u, 1.3);
+    ctx.beginPath();
+    smoothPath(ctx, front, false);
+    ctx.strokeStyle = withAlpha('#ffffff', 0.9);
+    ctx.lineWidth = Math.max(1, config.barWidth * u * 0.8);
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  // 7. Turntable vinyl ----------------------------------------------------------------
+  private renderVinyl(
+    ctx: Ctx,
+    width: number,
+    height: number,
+    config: VisualizerConfig,
+    analysis: FrequencyAnalysis,
+    pal: Palette,
+    u: number,
+    dt: number
+  ) {
+    const { cx, cy, minDim } = this.center(config, width, height);
+    const s = minDim / 1000;
+    const R = minDim * (config.innerRadiusRatio + 0.1) * (1 + this.bassSmooth * 0.03);
+    // 33⅓ rpm ≈ 3.49 rad/s; scaled down for a calmer look
+    this.vinylAngle += dt * 1.6 * (config.turntableRotationSpeed ?? 1);
+
+    // Spectrum ring around the record
+    const count = Math.max(32, Math.round(config.barCount));
+    const spec = this.spectrum(Math.ceil(count / 2), analysis, config.smoothing);
+    const maxH = minDim * 0.12 * config.barHeightMultiplier;
+    ctx.save();
+    this.applyGlow(ctx, config, pal.glow, s);
+    ctx.strokeStyle = pal.primary;
+    ctx.lineWidth = Math.max(1, config.barWidth * s);
+    ctx.lineCap = 'round';
+    ctx.beginPath();
+    for (let i = 0; i < count; i++) {
+      const a = -Math.PI / 2 + (i / count) * Math.PI * 2;
+      const v = this.mirrored(spec, i, count, true);
+      const r0 = R + 14 * s;
+      const r1 = r0 + Math.max(2 * s, v * maxH);
+      ctx.moveTo(cx + Math.cos(a) * r0, cy + Math.sin(a) * r0);
+      ctx.lineTo(cx + Math.cos(a) * r1, cy + Math.sin(a) * r1);
+    }
+    ctx.stroke();
+    ctx.restore();
+
+    // Record body
+    ctx.save();
+    ctx.shadowBlur = 50 * s;
+    ctx.shadowColor = 'rgba(0,0,0,0.9)';
+    ctx.shadowOffsetY = 12 * s;
+    ctx.beginPath();
+    ctx.arc(cx, cy, R, 0, Math.PI * 2);
+    const body = ctx.createRadialGradient(cx, cy, R * 0.3, cx, cy, R);
+    body.addColorStop(0, '#16161c');
+    body.addColorStop(1, '#0a0a0e');
+    ctx.fillStyle = body;
+    ctx.fill();
+    ctx.restore();
+
+    // Grooves
+    ctx.save();
+    ctx.lineWidth = Math.max(0.5, 1 * s);
+    let idx = 0;
+    for (let r = R * 0.42; r < R * 0.97; r += Math.max(2, 4.5 * s)) {
+      ctx.strokeStyle = idx++ % 3 === 0 ? 'rgba(255,255,255,0.055)' : 'rgba(0,0,0,0.5)';
+      ctx.beginPath();
+      ctx.arc(cx, cy, r, 0, Math.PI * 2);
+      ctx.stroke();
+    }
+    // Rotating light sheen (two opposite cones)
+    ctx.translate(cx, cy);
+    ctx.rotate(this.vinylAngle * 0.15);
+    for (const base of [0, Math.PI]) {
+      const g = ctx.createConicGradient ? ctx.createConicGradient(base, 0, 0) : null;
+      if (g) {
+        g.addColorStop(0, 'rgba(255,255,255,0)');
+        g.addColorStop(0.06, 'rgba(255,255,255,0.10)');
+        g.addColorStop(0.12, 'rgba(255,255,255,0)');
+        g.addColorStop(1, 'rgba(255,255,255,0)');
+        ctx.fillStyle = g;
+        ctx.beginPath();
+        ctx.arc(0, 0, R * 0.97, 0, Math.PI * 2);
+        ctx.arc(0, 0, R * 0.4, 0, Math.PI * 2, true);
+        ctx.fill();
+      }
+    }
+    ctx.restore();
+
+    // Label (rotating)
+    const labelR = R * 0.36;
+    ctx.save();
+    ctx.translate(cx, cy);
+    ctx.rotate(this.vinylAngle);
+    ctx.beginPath();
+    ctx.arc(0, 0, labelR, 0, Math.PI * 2);
+    const lg = ctx.createLinearGradient(-labelR, -labelR, labelR, labelR);
+    lg.addColorStop(0, pal.primary);
+    lg.addColorStop(1, pal.secondary);
+    ctx.fillStyle = lg;
+    ctx.fill();
+    const img = this.getImage(config.logoUrl);
+    if (img) {
+      ctx.save();
+      ctx.beginPath();
+      ctx.arc(0, 0, labelR * 0.92, 0, Math.PI * 2);
+      ctx.clip();
+      drawImageCover(ctx, img, -labelR, -labelR, labelR * 2, labelR * 2);
+      ctx.restore();
+    }
+    ctx.beginPath();
+    ctx.arc(0, 0, labelR * 0.08, 0, Math.PI * 2);
+    ctx.fillStyle = '#d4d4d8';
+    ctx.fill();
+    ctx.restore();
+
+    // Rim glow
+    if (config.turntableGrooveGlow) {
+      ctx.save();
+      this.applyGlow(ctx, config, pal.glow, s, 1.4);
+      ctx.strokeStyle = withAlpha(pal.glow, 0.6 + this.bassSmooth * 0.4);
+      ctx.lineWidth = Math.max(1, (2 + this.bassSmooth * 5) * s);
+      ctx.beginPath();
+      ctx.arc(cx, cy, R + 2 * s, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.restore();
+    }
+
+    // Tonearm
+    ctx.save();
+    const px = cx + R * 1.08;
+    const py = cy - R * 0.92;
+    const armAngle = 2.05 + Math.sin(this.timeSec * 0.5) * 0.006;
+    ctx.translate(px, py);
+    ctx.fillStyle = '#3f3f46';
+    ctx.beginPath();
+    ctx.arc(0, 0, 26 * s, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = '#a1a1aa';
+    ctx.beginPath();
+    ctx.arc(0, 0, 12 * s, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.rotate(armAngle);
+    ctx.strokeStyle = '#d4d4d8';
+    ctx.lineWidth = Math.max(1, 7 * s);
+    ctx.lineCap = 'round';
+    ctx.beginPath();
+    ctx.moveTo(0, 0);
+    ctx.lineTo(R * 1.05, 0);
+    ctx.stroke();
+    ctx.fillStyle = '#e4e4e7';
+    ctx.fillRect(R * 1.02, -12 * s, 46 * s, 24 * s);
+    ctx.restore();
+  }
+
+  // 8. Album art pulse ---------------------------------------------------------------
+  private renderAlbumArt(
+    ctx: Ctx,
+    width: number,
+    height: number,
+    config: VisualizerConfig,
+    analysis: FrequencyAnalysis,
+    pal: Palette,
+    u: number
+  ) {
+    const { cx, cy, minDim } = this.center(config, width, height);
+    const s = minDim / 1000;
+    const size = minDim * 0.46 * (1 + this.bassSmooth * (config.logoPulseIntensity || 0.15));
+    const x = cx - size / 2;
+    const y = cy - size / 2;
+    const r = size * 0.05;
+
+    ctx.save();
+    // Glow + drop shadow
+    ctx.shadowBlur = (40 + this.bassSmooth * 40) * s;
+    ctx.shadowColor = withAlpha(pal.glow, 0.85);
+    ctx.fillStyle = '#0b0b10';
+    ctx.beginPath();
+    ctx.roundRect(x, y, size, size, r);
+    ctx.fill();
+    ctx.shadowBlur = 0;
+
+    ctx.save();
+    ctx.clip();
+    const img = this.getImage(config.logoUrl);
+    if (img) drawImageCover(ctx, img, x, y, size, size);
+    const sheen = ctx.createLinearGradient(x, y, x + size, y + size);
+    sheen.addColorStop(0, 'rgba(255,255,255,0.14)');
+    sheen.addColorStop(0.45, 'rgba(255,255,255,0)');
+    sheen.addColorStop(1, 'rgba(0,0,0,0.25)');
+    ctx.fillStyle = sheen;
+    ctx.fillRect(x, y, size, size);
+    ctx.restore();
+
+    ctx.strokeStyle = withAlpha(pal.primary, 0.8);
+    ctx.lineWidth = Math.max(1, 2.5 * s);
+    ctx.beginPath();
+    ctx.roundRect(x, y, size, size, r);
+    ctx.stroke();
+
+    // Spectrum strip beneath the cover
+    const count = 48;
+    const spec = this.spectrum(count / 2, analysis, config.smoothing);
+    const stripY = y + size + 34 * s;
+    const spacing = size / count;
+    const bw = spacing * 0.55;
+    const maxH = 70 * s * config.barHeightMultiplier;
+    this.applyGlow(ctx, config, pal.glow, s, 0.7);
+    ctx.fillStyle = pal.primary;
+    ctx.beginPath();
+    for (let i = 0; i < count; i++) {
+      const v = this.mirrored(spec, i, count, true);
+      const h = Math.max(3 * s, v * maxH);
+      ctx.roundRect(x + i * spacing + (spacing - bw) / 2, stripY - h / 2, bw, h, bw / 2);
+    }
+    ctx.fill();
+    ctx.restore();
+  }
+
+  // 9. Minimal ------------------------------------------------------------------------
+  private renderMinimal(
+    ctx: Ctx,
+    width: number,
+    height: number,
+    config: VisualizerConfig,
+    analysis: FrequencyAnalysis,
+    pal: Palette,
+    u: number
+  ) {
+    const { cx, cy, minDim } = this.center(config, width, height);
+    const s = minDim / 1000;
+    const count = Math.max(24, Math.round(config.barCount / 2));
+    const spec = this.spectrum(Math.ceil(count / 2), analysis, Math.max(0.8, config.smoothing));
+    const r = minDim * Math.max(0.14, config.innerRadiusRatio * 0.85);
+    const amp = minDim * 0.07 * config.barHeightMultiplier;
+
+    const pts = Array.from({ length: count }, (_, i) => {
+      const a = -Math.PI / 2 + (i / count) * Math.PI * 2 + this.timeSec * 0.05;
+      const d = r + this.mirrored(spec, i, count, true) * amp;
+      return { x: cx + Math.cos(a) * d, y: cy + Math.sin(a) * d };
+    });
+
+    ctx.save();
+    ctx.strokeStyle = withAlpha(pal.secondary, 0.35);
+    ctx.lineWidth = Math.max(0.6, 1 * s);
+    ctx.beginPath();
+    ctx.arc(cx, cy, r * 0.92, 0, Math.PI * 2);
+    ctx.stroke();
+
+    ctx.strokeStyle = withAlpha(pal.primary, 0.55);
+    ctx.beginPath();
+    smoothPath(ctx, pts, true);
+    ctx.stroke();
+
+    this.applyGlow(ctx, config, pal.glow, s, 0.6);
+    ctx.fillStyle = pal.primary;
+    ctx.beginPath();
+    for (const p of pts) {
+      ctx.moveTo(p.x + 2.5 * s, p.y);
+      ctx.arc(p.x, p.y, Math.max(1, 2.5 * s), 0, Math.PI * 2);
+    }
+    ctx.fill();
+    ctx.restore();
+  }
+
+  // 10. Particles-only energy core ---------------------------------------------------
+  private renderCore(
+    ctx: Ctx,
+    width: number,
+    height: number,
+    config: VisualizerConfig,
+    analysis: FrequencyAnalysis,
+    pal: Palette,
+    u: number
+  ) {
+    const { cx, cy, minDim } = this.center(config, width, height);
+    const bass = this.bassSmooth;
+    const core = minDim * 0.1 * (1 + bass * 0.6);
+
+    ctx.save();
+    ctx.globalCompositeOperation = 'lighter';
+    // light rays
+    ctx.translate(cx, cy);
+    ctx.rotate(this.timeSec * 0.12);
+    const rays = 12;
+    for (let i = 0; i < rays; i++) {
+      ctx.rotate((Math.PI * 2) / rays);
+      const len = core * (3 + analysis.mid * 3);
+      const g = ctx.createLinearGradient(0, 0, len, 0);
+      g.addColorStop(0, withAlpha(pal.glow, 0.25 + bass * 0.2));
+      g.addColorStop(1, withAlpha(pal.glow, 0));
+      ctx.fillStyle = g;
+      ctx.beginPath();
+      ctx.moveTo(0, 0);
+      ctx.lineTo(len, -core * 0.18);
+      ctx.lineTo(len, core * 0.18);
+      ctx.closePath();
+      ctx.fill();
+    }
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.restore();
+
+    ctx.save();
+    ctx.globalCompositeOperation = 'lighter';
+    for (const [mult, alpha, color] of [
+      [3.2, 0.18, pal.secondary],
+      [1.8, 0.35, pal.primary],
+      [1, 0.95, '#ffffff'],
+    ] as const) {
+      const rr = core * mult;
+      const g = ctx.createRadialGradient(cx, cy, 0, cx, cy, rr);
+      g.addColorStop(0, withAlpha(color, alpha));
+      g.addColorStop(0.45, withAlpha(color === '#ffffff' ? pal.primary : color, alpha * 0.5));
+      g.addColorStop(1, withAlpha(color === '#ffffff' ? pal.primary : color, 0));
+      ctx.fillStyle = g;
+      ctx.beginPath();
+      ctx.arc(cx, cy, rr, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.restore();
+  }
+
+  // ------------------------------------------------------------------ typography
+
+  private renderTypography(
+    ctx: Ctx,
+    width: number,
+    height: number,
+    config: VisualizerConfig,
+    bass: number,
+    playbackTime: number
+  ) {
+    const S = Math.min(width, height) / 1080;
+    const t = this.timeSec;
+    const bounds: TextBounds[] = [];
+    const layers = config.textLayers || [];
+
+    layers.forEach((layer: TextLayer, index) => {
+      if (!layer.enabled || !layer.text || !layer.text.trim()) return;
+
+      const content = layer.isUppercase ? layer.text.toUpperCase() : layer.text;
+      const fontSize = Math.max(6, layer.fontSize * S);
+      let x = (layer.x / 100) * width;
+      let y = (layer.y / 100) * height;
+
+      // Intro animation driven by the track playhead (so exports start with it)
+      let introAlpha = 1;
+      let introScale = 1;
+      const enter = layer.enterAnimation || 'none';
+      if (enter !== 'none') {
+        const delay = 0.25 + index * 0.18;
+        const p = Math.max(0, Math.min(1, (playbackTime - delay) / 0.9));
+        const e = 1 - Math.pow(1 - p, 3);
+        introAlpha = e;
+        if (enter === 'slide-up') y += (1 - e) * 40 * S;
+        if (enter === 'scale-up') introScale = 0.6 + 0.4 * e;
+      }
+      if (introAlpha <= 0.001) return;
+
+      let pulse = 1;
+      if (layer.animation === 'bass-pulse') pulse = 1 + bass * (layer.audioReactivity ?? 0.2);
+      else if (layer.animation === 'gentle-float') y += Math.sin(t * 2.2 + index) * 6 * S;
+
+      ctx.save();
+      ctx.font = `${layer.isItalic ? 'italic ' : ''}${layer.fontWeight || '700'} ${fontSize}px "${layer.fontFamily || 'Outfit'}", sans-serif`;
+      const spacing = (layer.letterSpacing || 0) * S;
+      const ls = ctx as unknown as { letterSpacing?: string };
+      if ('letterSpacing' in ctx) ls.letterSpacing = `${spacing}px`;
       ctx.textAlign = layer.align || 'center';
       ctx.textBaseline = 'middle';
 
-      // 1. Draw Optional Background Box Behind Text
+      const metrics = ctx.measureText(content);
+      const textW = metrics.width;
+      const padX = layer.boxEnabled ? (layer.boxPaddingX || 0) * S : 0;
+      const padY = layer.boxEnabled ? (layer.boxPaddingY || 0) * S : 0;
+      const boxW = textW + padX * 2;
+      const boxH = fontSize * 1.15 + padY * 2;
+      let left = -boxW / 2;
+      if (layer.align === 'left') left = -padX;
+      else if (layer.align === 'right') left = -textW - padX;
+
+      const totalScale = pulse * introScale;
+      bounds.push({
+        id: layer.id,
+        x: x + left * totalScale,
+        y: y - (boxH / 2) * totalScale,
+        w: boxW * totalScale,
+        h: boxH * totalScale,
+      });
+
+      ctx.translate(x, y);
+      if (totalScale !== 1) ctx.scale(totalScale, totalScale);
+      const baseAlpha = (layer.opacity ?? 1) * introAlpha;
+
       if (layer.boxEnabled) {
         ctx.save();
-        const metrics = ctx.measureText(textContent);
-        const padX = (layer.boxPaddingX || 12) * scaleRatio;
-        const padY = (layer.boxPaddingY || 6) * scaleRatio;
-        const boxW = metrics.width + padX * 2;
-        const boxH = scaledFontSize + padY * 2;
-        const radius = (layer.boxBorderRadius || 6) * scaleRatio;
-
-        let boxX = -boxW / 2;
-        if (layer.align === 'left') boxX = -padX;
-        else if (layer.align === 'right') boxX = -boxW + padX;
-        const boxY = -boxH / 2;
-
+        ctx.globalAlpha = (layer.boxOpacity ?? 0.6) * introAlpha;
+        ctx.fillStyle = layer.boxColor || '#000';
         ctx.beginPath();
-        ctx.roundRect(boxX, boxY, boxW, boxH, radius);
-        ctx.fillStyle = layer.boxColor || '#000000';
-        ctx.globalAlpha = layer.boxOpacity !== undefined ? layer.boxOpacity : 0.6;
+        ctx.roundRect(left, -boxH / 2, boxW, boxH, Math.min(boxH / 2, (layer.boxBorderRadius || 0) * S));
         ctx.fill();
-
-        if (layer.boxBorderWidth && layer.boxBorderWidth > 0) {
+        if (layer.boxBorderWidth > 0) {
+          ctx.globalAlpha = introAlpha;
           ctx.strokeStyle = layer.boxBorderColor || 'rgba(255,255,255,0.2)';
-          ctx.lineWidth = layer.boxBorderWidth * scaleRatio;
+          ctx.lineWidth = layer.boxBorderWidth * S;
           ctx.stroke();
         }
         ctx.restore();
       }
 
-      // 2. Setup Glow & Shadows
+      ctx.globalAlpha = baseAlpha;
       if (layer.glowEnabled) {
-        let currentGlowBlur = (layer.glowBlur || 14) * scaleRatio;
-        if (layer.animation === 'glow-breath') {
-          const breath = 1.0 + Math.sin(timeSec * 3) * 0.4 + bassWeight * 0.5;
-          currentGlowBlur *= breath;
-        }
+        let blur = (layer.glowBlur || 14) * S;
+        if (layer.animation === 'glow-breath') blur *= 1 + Math.sin(t * 3) * 0.35 + bass * 0.6;
         ctx.shadowColor = layer.glowColor || layer.color;
-        ctx.shadowBlur = currentGlowBlur;
-      } else if (layer.shadowColor) {
+        ctx.shadowBlur = blur;
+      } else if (layer.shadowColor && (layer.shadowOffsetX || layer.shadowOffsetY)) {
         ctx.shadowColor = layer.shadowColor;
-        ctx.shadowBlur = 8 * scaleRatio;
-        ctx.shadowOffsetX = (layer.shadowOffsetX || 0) * scaleRatio;
-        ctx.shadowOffsetY = (layer.shadowOffsetY || 0) * scaleRatio;
+        ctx.shadowBlur = 10 * S;
+        ctx.shadowOffsetX = (layer.shadowOffsetX || 0) * S;
+        ctx.shadowOffsetY = (layer.shadowOffsetY || 0) * S;
       }
 
-      // 3. Optional Text Stroke / Outline
+      // Text x anchor (letterSpacing adds trailing space; compensate when centred)
+      const anchorX = layer.align === 'center' ? spacing / 2 : 0;
+
       if (layer.textStrokeWidth && layer.textStrokeWidth > 0) {
-        ctx.strokeStyle = layer.textStrokeColor || '#000000';
-        ctx.lineWidth = layer.textStrokeWidth * scaleRatio;
-        ctx.strokeText(textContent, 0, 0);
+        ctx.strokeStyle = layer.textStrokeColor || '#000';
+        ctx.lineWidth = layer.textStrokeWidth * S * 2;
+        ctx.lineJoin = 'round';
+        ctx.strokeText(content, anchorX, 0);
       }
-
-      // 4. Render Text Fill
-      ctx.fillStyle = layer.color || '#ffffff';
-      ctx.globalAlpha = layer.opacity !== undefined ? layer.opacity : 1;
-      ctx.fillText(textContent, 0, 0);
-
+      ctx.fillStyle = layer.color || '#fff';
+      ctx.fillText(content, anchorX, 0);
       ctx.restore();
-    }
+    });
+
+    this.lastTextBounds = bounds;
   }
 }
 
+/** Shared instance used by the live preview. The exporter creates its own. */
 export const visualizerRenderer = new VisualizerRenderer();

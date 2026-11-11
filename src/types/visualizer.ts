@@ -1,20 +1,21 @@
 export type WaveStyle = 'bars' | 'smooth-curve' | 'mirror-bars' | 'dots' | 'radial-spikes';
 export type LogoShape = 'circle' | 'ring' | 'rounded-square' | 'hexagon';
-export type ExportResolution = '1080p' | '4k' | '720p' | 'square';
+export type ExportResolution = '1080p' | '4k' | '720p' | 'square' | 'vertical';
 export type ExportDurationMode = 'full' | '15s' | '30s' | '60s' | 'custom';
 export type ExportFormat = 'mp4' | 'webm';
+export type AspectRatio = '16:9' | '1:1' | '9:16';
 
 export type VisualizerLayoutStyle =
-  | 'classic-circle'       // 1. Cerchio centrale classico attorno a logo o immagine
-  | 'bottom-bars'          // 2. Barre dal basso verticali che salgono come un equalizzatore
-  | 'mirror-bars'          // 3. Barre specchiate che si riflettono simmetricamente
-  | 'horizontal-wave'      // 4. Waveform orizzontale posizionabile in basso, al centro o in alto
-  | 'side-bars'            // 5. Barre laterali disposte sui bordi dello schermo
-  | 'full-width'           // 6. Visualizzatore full width a tutta larghezza
-  | 'turntable-vinyl'      // 7. Modalità giradischi con vinile centrale animato e rotante
-  | 'album-art-pulse'      // 8. Modalità album art pulse con artwork che pulsa a tempo
-  | 'minimal'              // 9. Modalità minimal elegante e discreta
-  | 'particles-only';      // 10. Modalità solo particelle e glow senza barre invasive
+  | 'classic-circle'
+  | 'bottom-bars'
+  | 'mirror-bars'
+  | 'horizontal-wave'
+  | 'side-bars'
+  | 'full-width'
+  | 'turntable-vinyl'
+  | 'album-art-pulse'
+  | 'minimal'
+  | 'particles-only';
 
 export type TextFontFamily =
   | 'Outfit'
@@ -33,30 +34,27 @@ export interface TextLayer {
   enabled: boolean;
   label: string;
   text: string;
-  // Position as percentage across canvas (0 to 100%)
+  /** Position as percentage of the frame (0–100). */
   x: number;
   y: number;
-  // Typography
+  /** Font size in px relative to a 1080px-tall frame. */
   fontSize: number;
   fontFamily: TextFontFamily;
   fontWeight: '400' | '600' | '700' | '800';
   isItalic: boolean;
   isUppercase: boolean;
-  letterSpacing: number; // in px
+  letterSpacing: number;
   align: TextAlign;
   color: string;
-  opacity: number; // 0 to 1
-  // Text outline / stroke
+  opacity: number;
   textStrokeWidth?: number;
   textStrokeColor?: string;
-  // Glow / Shadow
   glowEnabled: boolean;
   glowColor: string;
   glowBlur: number;
   shadowOffsetX: number;
   shadowOffsetY: number;
   shadowColor: string;
-  // Background Box
   boxEnabled: boolean;
   boxColor: string;
   boxOpacity: number;
@@ -65,79 +63,81 @@ export interface TextLayer {
   boxBorderRadius: number;
   boxBorderWidth: number;
   boxBorderColor: string;
-  // Animation / Audio Reactivity
   animation: TextAnimation;
   enterAnimation?: TextEnterAnimation;
-  audioReactivity: number; // 0 to 1
+  audioReactivity: number;
   isLocked?: boolean;
 }
 
 export interface VisualizerConfig {
-  // Layout Style (The 10 main visualizer modes)
   layoutStyle: VisualizerLayoutStyle;
 
-  // Wave options
   waveStyle: WaveStyle;
   barCount: number;
-  innerRadiusRatio: number; // 0.15 to 0.45 of canvas min-dimension
+  innerRadiusRatio: number;
   barHeightMultiplier: number;
   barWidth: number;
-  smoothing: number; // 0.5 to 0.95
+  smoothing: number;
   mirrorWave: boolean;
 
-  // Cleanliness & Boundary Constraints (Prevents unwanted deformities/bleed)
-  preventDownwardBleed: boolean; // Cleans circular wave, prevents dipping underneath
+  preventDownwardBleed: boolean;
   clampingMode: 'outward-only' | 'symmetric' | 'contained';
-  maxBarHeightRatio: number; // 0.1 to 0.6 of screen height
-  bottomOffsetPercent: number; // 0% to 35% distance from bottom for bottom/horizontal modes
+  maxBarHeightRatio: number;
+  bottomOffsetPercent: number;
   waveVerticalPosition: 'bottom' | 'center' | 'top';
 
-  // Turntable Vinyl Mode Settings
-  turntableRotationSpeed: number; // RPM multiplier
+  turntableRotationSpeed: number;
   turntableGrooveGlow: boolean;
 
-  // Visualizer Transform (Size & Position)
-  visualizerScale: number; // 0.4 to 2.2
-  visualizerX: number; // 0 to 100% (center is 50%)
-  visualizerY: number; // 0 to 100% (center is 50%)
+  visualizerScale: number;
+  visualizerX: number;
+  visualizerY: number;
 
-  // Colors & Glow
   primaryColor: string;
   secondaryColor: string;
   glowColor: string;
-  glowIntensity: number; // 0 to 40 px shadowBlur
+  glowIntensity: number;
+  /** Degrees per second of automatic hue rotation (0 = off). */
+  colorCycleSpeed: number;
 
-  // Logo & Central Element
   logoUrl: string;
   logoShape: LogoShape;
-  logoPulseIntensity: number; // 0 to 0.5 scale boost on bass
+  logoPulseIntensity: number;
   logoBorderWidth: number;
   logoBorderColor: string;
+  logoSpin: boolean;
 
-  // Particles & Effects
   particleCount: number;
   particleMinSpeed: number;
   particleMaxSpeed: number;
   particleSize: number;
-  particleBassImpact: number; // velocity impulse on bass drop
+  particleBassImpact: number;
   particleColor: string;
   particleGlow: boolean;
   particleSparkle: boolean;
   particleDispersion: 'radial' | 'upward' | 'ambient';
   particleOpacity: number;
 
-  // Background & Camera
   backgroundUrl: string;
   backgroundBlur: number;
   backgroundVignette: number;
-  backgroundDim: number; // 0 (bright) to 0.8 (dark)
+  backgroundDim: number;
+  backgroundParallax: boolean;
   bassCameraShake: boolean;
   bassZoomIntensity: number;
 
-  // Dedicated Video Text Layers
+  /** Brief bright flash on detected kicks. */
+  beatFlash: boolean;
+  /** Expanding rings emitted on detected kicks. */
+  shockwaveRings: boolean;
+  /** Subtle analog film grain overlay (0–1). */
+  filmGrain: number;
+  /** Chromatic RGB split on bass (0–1). */
+  chromaticAberration: number;
+
   textLayers: TextLayer[];
 
-  // Legacy compatibility fields
+  // Legacy fields kept for project compatibility
   showTrackInfo?: boolean;
   trackTitle?: string;
   artistName?: string;
@@ -150,6 +150,8 @@ export interface Preset {
   name: string;
   tagline: string;
   isCustom?: boolean;
+  /** Two-color swatch used for preview chips. */
+  swatch?: [string, string];
   config: Partial<VisualizerConfig>;
 }
 
@@ -161,7 +163,6 @@ export interface AudioTrackInfo {
   isCustom: boolean;
   bpm?: number;
   audioBuffer?: AudioBuffer;
-  blobUrl?: string;
 }
 
 export interface ExportSettings {
@@ -170,12 +171,14 @@ export interface ExportSettings {
   format: ExportFormat;
   durationMode: ExportDurationMode;
   customDurationSeconds?: number;
+  /** Start from the current playhead instead of 0. */
+  startFromPlayhead?: boolean;
   bitrateMbps: number;
 }
 
 export interface ExportProgress {
   isExporting: boolean;
-  progressPercent: number; // 0 to 100
+  progressPercent: number;
   currentFrame: number;
   totalFrames: number;
   elapsedSeconds: number;
@@ -190,7 +193,8 @@ export type SelectionTarget =
   | { type: 'text'; layerId: string }
   | { type: 'particles' }
   | { type: 'background' }
-  | { type: 'logo' };
+  | { type: 'logo' }
+  | { type: 'effects' };
 
 export interface ProjectData {
   version: string;
@@ -200,3 +204,16 @@ export interface ProjectData {
   exportSettings: ExportSettings;
 }
 
+export const RESOLUTION_SIZES: Record<ExportResolution, { width: number; height: number; label: string }> = {
+  '720p': { width: 1280, height: 720, label: 'HD 720p' },
+  '1080p': { width: 1920, height: 1080, label: 'Full HD 1080p' },
+  '4k': { width: 3840, height: 2160, label: '4K Ultra HD' },
+  square: { width: 1080, height: 1080, label: 'Quadrato 1:1' },
+  vertical: { width: 1080, height: 1920, label: 'Verticale 9:16' },
+};
+
+export function aspectOfResolution(res: ExportResolution): AspectRatio {
+  if (res === 'square') return '1:1';
+  if (res === 'vertical') return '9:16';
+  return '16:9';
+}
