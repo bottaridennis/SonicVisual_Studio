@@ -1,30 +1,35 @@
 /**
- * Web Audio API Engine
- * Handles decoding, FFT frequency analysis, bass detection,
- * transport playback, and MediaStream destination for video export.
+ * Web Audio playback engine: decoding, transport, FFT analysis.
+ * UI components subscribe to transport state changes via `subscribe`.
  */
+import {
+  BandAnalyzer,
+  FrequencyAnalysis,
+  configureAnalyser,
+  createEmptyAnalysis,
+} from './analysis';
 
-export interface FrequencyAnalysis {
-  frequencyData: Uint8Array;
-  timeDomainData: Uint8Array;
-  subBass: number;   // 0.0 - 1.0 (20-60 Hz)
-  bass: number;      // 0.0 - 1.0 (60-250 Hz)
-  lowMid: number;    // 0.0 - 1.0 (250-500 Hz)
-  mid: number;       // 0.0 - 1.0 (500-2000 Hz)
-  treble: number;    // 0.0 - 1.0 (2000-10000 Hz)
-  peakEnergy: number; // 0.0 - 1.0
-  isBeatHit: boolean; // transient kick detection
+export type { FrequencyAnalysis } from './analysis';
+
+export interface TransportState {
+  isPlaying: boolean;
+  isMuted: boolean;
+  isLooping: boolean;
+  volume: number;
+  duration: number;
 }
+
+type Listener = (state: TransportState) => void;
 
 class AudioEngine {
   private ctx: AudioContext | null = null;
   private analyser: AnalyserNode | null = null;
   private gainNode: GainNode | null = null;
-  private mediaStreamDest: MediaStreamAudioDestinationNode | null = null;
-  
+  private bandAnalyzer: BandAnalyzer | null = null;
+
   private sourceNode: AudioBufferSourceNode | null = null;
   private currentBuffer: AudioBuffer | null = null;
-  
+
   private isPlaying = false;
   private startTime = 0;
   private pauseOffset = 0;
@@ -32,288 +37,214 @@ class AudioEngine {
   private isMuted = false;
   private loop = true;
 
-  // Running beat detection statistics
-  private bassRunningAverage = 0.2;
-  private beatDecay = 0.95;
-  private beatCooldown = 0;
+  private listeners = new Set<Listener>();
+  private idleAnalysis = createEmptyAnalysis();
 
-  // Cache arrays for FFT to avoid GC pressure
-  private freqArray: Uint8Array | null = null;
-  private timeArray: Uint8Array | null = null;
+  // ---------------------------------------------------------------- state
+  subscribe(listener: Listener): () => void {
+    this.listeners.add(listener);
+    listener(this.getState());
+    return () => {
+      this.listeners.delete(listener);
+    };
+  }
 
-  public onEndedCallback: (() => void) | null = null;
-  public onTimeUpdateCallback: ((currentTime: number, duration: number) => void) | null = null;
+  getState(): TransportState {
+    return {
+      isPlaying: this.isPlaying,
+      isMuted: this.isMuted,
+      isLooping: this.loop,
+      volume: this.volume,
+      duration: this.getDuration(),
+    };
+  }
 
+  private emit() {
+    const s = this.getState();
+    this.listeners.forEach((l) => l(s));
+  }
+
+  // ---------------------------------------------------------------- graph
   private ensureContext(): AudioContext {
     if (!this.ctx) {
-      const AudioCtx = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
-      this.ctx = new AudioCtx();
+      const Ctor =
+        window.AudioContext ||
+        (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+      this.ctx = new Ctor();
     }
     if (this.ctx.state === 'suspended') {
-      this.ctx.resume();
+      this.ctx.resume().catch(() => {});
     }
     return this.ctx;
   }
 
   private initNodes() {
     const ctx = this.ensureContext();
-    if (!this.analyser) {
-      this.analyser = ctx.createAnalyser();
-      this.analyser.fftSize = 1024;
-      this.analyser.smoothingTimeConstant = 0.8;
-      this.analyser.minDecibels = -90;
-      this.analyser.maxDecibels = -10;
+    if (this.analyser) return;
+    this.analyser = ctx.createAnalyser();
+    configureAnalyser(this.analyser);
+    this.gainNode = ctx.createGain();
+    this.gainNode.gain.value = this.isMuted ? 0 : this.volume;
+    this.analyser.connect(this.gainNode);
+    this.gainNode.connect(ctx.destination);
+    this.bandAnalyzer = new BandAnalyzer(this.analyser);
+  }
 
-      this.gainNode = ctx.createGain();
-      this.gainNode.gain.setValueAtTime(this.isMuted ? 0 : this.volume, ctx.currentTime);
-
-      this.mediaStreamDest = ctx.createMediaStreamDestination();
-
-      // Audio routing: Source -> Analyser -> Gain -> [Destination & MediaStreamDestination]
-      this.analyser.connect(this.gainNode);
-      this.gainNode.connect(ctx.destination);
-      this.gainNode.connect(this.mediaStreamDest);
-
-      this.freqArray = new Uint8Array(this.analyser.frequencyBinCount);
-      this.timeArray = new Uint8Array(this.analyser.frequencyBinCount);
+  private applyGain() {
+    if (this.gainNode && this.ctx) {
+      this.gainNode.gain.setTargetAtTime(this.isMuted ? 0 : this.volume, this.ctx.currentTime, 0.015);
     }
   }
 
-  public async decodeAudioFile(file: File): Promise<AudioBuffer> {
+  // ---------------------------------------------------------------- loading
+  async decodeAudioFile(file: File): Promise<AudioBuffer> {
     const ctx = this.ensureContext();
     const arrayBuffer = await file.arrayBuffer();
-    const decoded = await ctx.decodeAudioData(arrayBuffer);
-    this.currentBuffer = decoded;
-    this.pauseOffset = 0;
-    return decoded;
+    return await ctx.decodeAudioData(arrayBuffer);
   }
 
-  public setAudioBuffer(buffer: AudioBuffer) {
+  setAudioBuffer(buffer: AudioBuffer) {
     this.stop();
     this.currentBuffer = buffer;
     this.pauseOffset = 0;
+    this.bandAnalyzer?.reset();
+    this.emit();
   }
 
-  public getAudioBuffer(): AudioBuffer | null {
+  getAudioBuffer(): AudioBuffer | null {
     return this.currentBuffer;
   }
 
-  public play(offset?: number) {
+  // ---------------------------------------------------------------- transport
+  play(offset?: number) {
     if (!this.currentBuffer) return;
     const ctx = this.ensureContext();
     this.initNodes();
+    this.stopSource();
 
-    if (this.isPlaying) {
-      this.stopSource();
-    }
+    const duration = this.currentBuffer.duration;
+    let seek = offset !== undefined ? offset : this.pauseOffset;
+    if (seek >= duration - 0.01) seek = 0;
+    seek = Math.max(0, seek);
 
-    const seekTime = offset !== undefined ? offset : this.pauseOffset;
-    const clampedSeek = Math.max(0, Math.min(seekTime, this.currentBuffer.duration));
-
-    this.sourceNode = ctx.createBufferSource();
-    this.sourceNode.buffer = this.currentBuffer;
-    this.sourceNode.loop = this.loop;
-
-    this.sourceNode.connect(this.analyser!);
-
-    this.sourceNode.onended = () => {
-      if (this.isPlaying && !this.loop) {
-        this.isPlaying = false;
-        this.pauseOffset = 0;
-        if (this.onEndedCallback) this.onEndedCallback();
-      }
+    const src = ctx.createBufferSource();
+    src.buffer = this.currentBuffer;
+    src.loop = this.loop;
+    src.connect(this.analyser!);
+    src.onended = () => {
+      if (this.sourceNode !== src) return;
+      this.sourceNode = null;
+      this.isPlaying = false;
+      this.pauseOffset = 0;
+      this.emit();
     };
+    src.start(0, seek);
 
-    this.sourceNode.start(0, clampedSeek);
-    this.startTime = ctx.currentTime - clampedSeek;
-    this.pauseOffset = clampedSeek;
+    this.sourceNode = src;
+    this.startTime = ctx.currentTime - seek;
+    this.pauseOffset = seek;
     this.isPlaying = true;
+    this.emit();
   }
 
-  public pause() {
+  pause() {
     if (!this.isPlaying) return;
-    const ctx = this.ensureContext();
-    this.pauseOffset = (ctx.currentTime - this.startTime) % (this.currentBuffer?.duration || 1);
+    this.pauseOffset = this.getCurrentTime();
     this.stopSource();
     this.isPlaying = false;
+    this.emit();
   }
 
-  public togglePlay() {
-    if (this.isPlaying) {
-      this.pause();
-    } else {
-      this.play();
-    }
+  togglePlay() {
+    if (this.isPlaying) this.pause();
+    else this.play();
   }
 
-  public stop() {
+  stop() {
     this.stopSource();
     this.isPlaying = false;
     this.pauseOffset = 0;
+    this.emit();
   }
 
   private stopSource() {
-    if (this.sourceNode) {
+    const src = this.sourceNode;
+    this.sourceNode = null;
+    if (src) {
+      src.onended = null;
       try {
-        this.sourceNode.onended = null;
-        this.sourceNode.stop();
-        this.sourceNode.disconnect();
+        src.stop();
       } catch {
-        // Source already stopped
+        /* already stopped */
       }
-      this.sourceNode = null;
+      src.disconnect();
     }
   }
 
-  public seek(targetSeconds: number) {
-    const wasPlaying = this.isPlaying;
-    if (wasPlaying) {
-      this.pause();
-    }
-    this.pauseOffset = Math.max(0, Math.min(targetSeconds, this.getDuration()));
-    if (wasPlaying) {
-      this.play(this.pauseOffset);
+  seek(targetSeconds: number) {
+    const t = Math.max(0, Math.min(targetSeconds, this.getDuration()));
+    if (this.isPlaying) {
+      this.play(t);
+    } else {
+      this.pauseOffset = t;
+      this.emit();
     }
   }
 
-  public getCurrentTime(): number {
+  getCurrentTime(): number {
     if (!this.currentBuffer) return 0;
     if (this.isPlaying && this.ctx) {
       const elapsed = this.ctx.currentTime - this.startTime;
-      return this.loop ? elapsed % this.currentBuffer.duration : Math.min(elapsed, this.currentBuffer.duration);
+      const d = this.currentBuffer.duration;
+      return this.loop ? elapsed % d : Math.min(elapsed, d);
     }
     return this.pauseOffset;
   }
 
-  public getDuration(): number {
+  getDuration(): number {
     return this.currentBuffer ? this.currentBuffer.duration : 0;
   }
 
-  public getIsPlaying(): boolean {
+  getIsPlaying(): boolean {
     return this.isPlaying;
   }
 
-  public setVolume(vol: number) {
+  setVolume(vol: number) {
     this.volume = Math.max(0, Math.min(1, vol));
-    if (this.gainNode && this.ctx) {
-      this.gainNode.gain.setValueAtTime(this.isMuted ? 0 : this.volume, this.ctx.currentTime);
-    }
+    if (this.volume > 0 && this.isMuted) this.isMuted = false;
+    this.applyGain();
+    this.emit();
   }
 
-  public getVolume(): number {
-    return this.volume;
-  }
-
-  public toggleMute(): boolean {
+  toggleMute() {
     this.isMuted = !this.isMuted;
-    if (this.gainNode && this.ctx) {
-      this.gainNode.gain.setValueAtTime(this.isMuted ? 0 : this.volume, this.ctx.currentTime);
-    }
-    return this.isMuted;
+    this.applyGain();
+    this.emit();
   }
 
-  public getIsMuted(): boolean {
-    return this.isMuted;
-  }
-
-  public toggleLoop(): boolean {
+  toggleLoop() {
+    // Re-anchor the timeline so the playhead stays consistent when switching mode.
+    const t = this.getCurrentTime();
     this.loop = !this.loop;
-    if (this.sourceNode) {
+    if (this.sourceNode && this.ctx) {
       this.sourceNode.loop = this.loop;
+      this.startTime = this.ctx.currentTime - t;
     }
-    return this.loop;
+    this.emit();
   }
 
-  public getIsLoop(): boolean {
-    return this.loop;
-  }
+  // ---------------------------------------------------------------- analysis
+  private lastAnalysis: FrequencyAnalysis | null = null;
+  private lastAnalysisAt = -1;
 
-  public setSmoothing(smoothing: number) {
-    if (this.analyser) {
-      this.analyser.smoothingTimeConstant = Math.max(0.1, Math.min(0.95, smoothing));
-    }
-  }
-
-  public getMediaStreamDestination(): MediaStreamAudioDestinationNode | null {
-    this.initNodes();
-    return this.mediaStreamDest;
-  }
-
-  /**
-   * Performs real-time audio FFT frequency decomposition
-   * Separates sub-bass (20-60 Hz) and bass (60-250 Hz) for heavy reactive visuals.
-   */
-  public analyze(): FrequencyAnalysis {
-    if (!this.analyser || !this.freqArray || !this.timeArray) {
-      const empty = new Uint8Array(128);
-      return {
-        frequencyData: empty,
-        timeDomainData: empty,
-        subBass: 0,
-        bass: 0,
-        lowMid: 0,
-        mid: 0,
-        treble: 0,
-        peakEnergy: 0,
-        isBeatHit: false,
-      };
-    }
-
-    this.analyser.getByteFrequencyData(this.freqArray as unknown as Uint8Array<ArrayBuffer>);
-    this.analyser.getByteTimeDomainData(this.timeArray as unknown as Uint8Array<ArrayBuffer>);
-
-    const binCount = this.analyser.frequencyBinCount;
-    const nyquist = (this.ctx?.sampleRate || 44100) / 2;
-    const hzPerBin = nyquist / binCount;
-
-    // Helper to calculate average energy across Hz frequency range
-    const getRangeEnergy = (startHz: number, endHz: number): number => {
-      const startBin = Math.max(0, Math.floor(startHz / hzPerBin));
-      const endBin = Math.min(binCount - 1, Math.ceil(endHz / hzPerBin));
-      if (startBin >= endBin) return 0;
-      let sum = 0;
-      for (let i = startBin; i <= endBin; i++) {
-        sum += this.freqArray![i];
-      }
-      return (sum / (endBin - startBin + 1)) / 255;
-    };
-
-    const subBass = getRangeEnergy(20, 70);
-    const bass = getRangeEnergy(70, 250);
-    const lowMid = getRangeEnergy(250, 600);
-    const mid = getRangeEnergy(600, 2500);
-    const treble = getRangeEnergy(2500, 10000);
-
-    const bassWeight = subBass * 0.7 + bass * 0.3;
-    const peakEnergy = Math.max(subBass, bass, mid);
-
-    // Dynamic Kick / Beat Drop detection
-    let isBeatHit = false;
-    if (this.beatCooldown > 0) {
-      this.beatCooldown--;
-    } else if (bassWeight > this.bassRunningAverage * 1.38 && bassWeight > 0.45) {
-      isBeatHit = true;
-      this.beatCooldown = 8; // prevent rapid flutter triggers
-    }
-
-    // Adapt running average
-    this.bassRunningAverage = this.bassRunningAverage * this.beatDecay + bassWeight * (1 - this.beatDecay);
-
-    return {
-      frequencyData: this.freqArray,
-      timeDomainData: this.timeArray,
-      subBass,
-      bass,
-      lowMid,
-      mid,
-      treble,
-      peakEnergy,
-      isBeatHit,
-    };
-  }
-
-  public getContext(): AudioContext | null {
-    return this.ctx;
+  /** Several components may read the analysis in the same frame: cache it briefly so beats aren't consumed twice. */
+  analyze(): FrequencyAnalysis {
+    if (!this.bandAnalyzer) return this.idleAnalysis;
+    const now = performance.now();
+    if (this.lastAnalysis && now - this.lastAnalysisAt < 6) return this.lastAnalysis;
+    this.lastAnalysis = this.bandAnalyzer.analyze(now);
+    this.lastAnalysisAt = now;
+    return this.lastAnalysis;
   }
 }
 
