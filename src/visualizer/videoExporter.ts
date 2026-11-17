@@ -1,7 +1,7 @@
 import { ExportSettings, ExportProgress, VisualizerConfig, RESOLUTION_SIZES } from '../types/visualizer';
 import { VisualizerRenderer } from './renderer';
 import { audioEngine } from '../audio/audioEngine';
-import { BandAnalyzer, configureAnalyser } from '../audio/analysis';
+import { BandAnalyzer, OfflineAnalyzer, configureAnalyser } from '../audio/analysis';
 
 export interface FormatSupport {
   mp4Supported: boolean;
@@ -55,6 +55,67 @@ export function getExportDuration(settings: ExportSettings, audioDuration: numbe
   }
 }
 
+
+// ---------------------------------------------------------------------------------------------
+// Frame-accurate offline export (WebCodecs)
+// ---------------------------------------------------------------------------------------------
+
+export type ExportMode = 'offline' | 'realtime';
+
+export interface EncoderPlan {
+  mode: ExportMode;
+  container: 'mp4' | 'webm';
+  videoCodec: 'avc' | 'vp9' | 'vp8' | 'av1' | null;
+  audioCodec: 'aac' | 'opus' | 'vorbis' | null;
+}
+
+export function hasWebCodecs(): boolean {
+  return typeof VideoEncoder !== 'undefined' && typeof AudioEncoder !== 'undefined' && typeof VideoFrame !== 'undefined';
+}
+
+/** Chooses the best container/codecs the browser can actually encode for these settings. */
+export async function planEncoding(settings: ExportSettings): Promise<EncoderPlan> {
+  const fallback: EncoderPlan = { mode: 'realtime', container: settings.format, videoCodec: null, audioCodec: null };
+  if (!hasWebCodecs()) return fallback;
+  try {
+    const { getFirstEncodableVideoCodec, getFirstEncodableAudioCodec, Quality } = await import('mediabunny');
+    const { width, height } = RESOLUTION_SIZES[settings.resolution];
+    const vOpts = { width, height, frameRate: settings.fps, quality: new Quality({ bitrate: settings.bitrateMbps * 1_000_000 }) };
+    const aOpts = { numberOfChannels: 2, sampleRate: 48000, quality: new Quality({ bitrate: 192_000 }) };
+
+    if (settings.format === 'mp4') {
+      const v = await getFirstEncodableVideoCodec(['avc'], vOpts);
+      const a = v ? await getFirstEncodableAudioCodec(['aac', 'opus'], aOpts) : null;
+      if (v && a) return { mode: 'offline', container: 'mp4', videoCodec: 'avc', audioCodec: a as 'aac' | 'opus' };
+    }
+    const v = await getFirstEncodableVideoCodec(['vp9', 'vp8', 'av1'], vOpts);
+    const a = v ? await getFirstEncodableAudioCodec(['opus', 'vorbis'], aOpts) : null;
+    if (v && a) return { mode: 'offline', container: 'webm', videoCodec: v as 'vp9' | 'vp8' | 'av1', audioCodec: a as 'opus' | 'vorbis' };
+  } catch (e) {
+    console.warn('WebCodecs export unavailable, falling back to real-time capture:', e);
+  }
+  return fallback;
+}
+
+/** Yields to the event loop so the UI can repaint (MessageChannel is not throttled like timers in background tabs). */
+function yieldToUI(): Promise<void> {
+  return new Promise((resolve) => {
+    const ch = new MessageChannel();
+    ch.port1.onmessage = () => resolve();
+    ch.port2.postMessage(null);
+  });
+}
+
+function sliceAudioBuffer(buffer: AudioBuffer, start: number, duration: number): AudioBuffer {
+  const sr = buffer.sampleRate;
+  const s0 = Math.max(0, Math.floor(start * sr));
+  const len = Math.max(1, Math.min(buffer.length - s0, Math.round(duration * sr)));
+  const channels = Math.min(2, buffer.numberOfChannels);
+  const out = new AudioBuffer({ length: len, numberOfChannels: channels, sampleRate: sr });
+  for (let c = 0; c < channels; c++) out.copyToChannel(buffer.getChannelData(c).subarray(s0, s0 + len), c);
+  return out;
+}
+
 export interface ExportResult {
   blob: Blob;
   url: string;
@@ -63,15 +124,21 @@ export interface ExportResult {
 }
 
 /**
- * Real-time exporter: plays the track through a private AudioContext, renders each frame
- * driven by the audio clock (so video and audio can never drift) and records both with MediaRecorder.
+ * Video exporter.
+ *
+ * Preferred path (WebCodecs): every frame is rendered and encoded with its exact timestamp, faster or slower
+ * than real time depending on the machine, so the result is perfectly smooth whatever the CPU/GPU load.
+ *
+ * Fallback (browsers without WebCodecs): real-time capture with MediaRecorder driven by the audio clock.
  */
 export class VideoExporter {
   private cancelled = false;
   private recorder: MediaRecorder | null = null;
+  private cancelOutput: (() => Promise<void>) | null = null;
 
   cancel() {
     this.cancelled = true;
+    this.cancelOutput?.().catch(() => {});
     if (this.recorder && this.recorder.state !== 'inactive') {
       try {
         this.recorder.stop();
@@ -88,7 +155,121 @@ export class VideoExporter {
     onProgress: (progress: ExportProgress) => void
   ): Promise<ExportResult> {
     this.cancelled = false;
+    const plan = await planEncoding(settings);
+    if (plan.mode === 'offline') return this.exportOffline(config, settings, startOffsetSeconds, onProgress, plan);
+    return this.exportRealtime(config, settings, startOffsetSeconds, onProgress);
+  }
 
+  private async exportOffline(
+    config: VisualizerConfig,
+    settings: ExportSettings,
+    startOffsetSeconds: number,
+    onProgress: (progress: ExportProgress) => void,
+    plan: EncoderPlan
+  ): Promise<ExportResult> {
+    const buffer = audioEngine.getAudioBuffer();
+    if (!buffer) throw new Error('Nessun audio caricato. Carica un brano prima di esportare.');
+    const { width, height, label } = RESOLUTION_SIZES[settings.resolution];
+    const start = Math.max(0, Math.min(startOffsetSeconds, buffer.duration - 0.5));
+    const duration = getExportDuration(settings, buffer.duration, start);
+    if (duration < 0.5) throw new Error('La durata da esportare è troppo breve. Sposta la testina più indietro.');
+
+    const fps = settings.fps;
+    const totalFrames = Math.max(1, Math.round(duration * fps));
+    const wallStart = performance.now();
+    const report = (frame: number, status: string, done = false) => {
+      const elapsed = (performance.now() - wallStart) / 1000;
+      const rate = frame / Math.max(0.001, elapsed);
+      onProgress({
+        isExporting: !done,
+        progressPercent: (frame / totalFrames) * 100,
+        currentFrame: frame,
+        totalFrames,
+        elapsedSeconds: elapsed,
+        etaSeconds: frame > 5 ? (totalFrames - frame) / rate : duration,
+        statusText: status,
+      });
+    };
+    report(0, 'Preparazione risorse…');
+
+    const mb = await import('mediabunny');
+    const canvas = document.createElement('canvas');
+    canvas.width = width;
+    canvas.height = height;
+    const ctx = canvas.getContext('2d', { alpha: false });
+    if (!ctx) throw new Error('Impossibile creare il canvas di rendering.');
+
+    const renderer = new VisualizerRenderer();
+    await Promise.all([
+      renderer.preloadImage(config.backgroundUrl),
+      renderer.preloadImage(config.logoUrl),
+      document.fonts?.ready ?? Promise.resolve(),
+    ]);
+    if (this.cancelled) throw new Error('Esportazione annullata.');
+
+    const analyzer = new OfflineAnalyzer(buffer);
+    const target = new mb.BufferTarget();
+    const output = new mb.Output({
+      format: plan.container === 'mp4' ? new mb.Mp4OutputFormat({ fastStart: 'in-memory' }) : new mb.WebMOutputFormat(),
+      target,
+    });
+    const videoSource = new mb.CanvasSource(canvas, {
+      codec: plan.videoCodec!,
+      quality: new mb.Quality({ bitrate: Math.round(settings.bitrateMbps * 1_000_000) }),
+      keyFrameInterval: 2,
+      latencyMode: 'quality',
+    });
+    const audioSource = new mb.AudioBufferSource({ codec: plan.audioCodec!, quality: new mb.Quality({ bitrate: 192_000 }) });
+    output.addVideoTrack(videoSource, { frameRate: fps });
+    output.addAudioTrack(audioSource);
+    this.cancelOutput = () => output.cancel();
+
+    const status = `Rendering ${label} · ${fps} fps · ${plan.container.toUpperCase()}`;
+    try {
+      await output.start();
+      await audioSource.add(sliceAudioBuffer(buffer, start, duration));
+      audioSource.close();
+
+      const frameDur = 1 / fps;
+      let lastYield = performance.now();
+      for (let i = 0; i < totalFrames; i++) {
+        if (this.cancelled) throw new Error('Esportazione annullata.');
+        const t = i * frameDur;
+        const analysis = analyzer.analyze(start + t);
+        renderer.renderFrame(ctx, width, height, analysis, config, i === 0 ? 0 : frameDur * 1000, start + t);
+        await videoSource.add(t, frameDur);
+
+        if (performance.now() - lastYield > 40) {
+          report(i + 1, status);
+          await yieldToUI();
+          lastYield = performance.now();
+        }
+      }
+      videoSource.close();
+      report(totalFrames, 'Finalizzazione del file…');
+      await output.finalize();
+    } catch (e) {
+      if (output.state !== 'canceled' && output.state !== 'finalized') await output.cancel().catch(() => {});
+      if (this.cancelled) throw new Error('Esportazione annullata.');
+      throw e instanceof Error ? e : new Error('Errore durante la codifica del video.');
+    } finally {
+      this.cancelOutput = null;
+    }
+
+    if (!target.buffer) throw new Error('Il file video risulta vuoto.');
+    const mimeType = plan.container === 'mp4' ? 'video/mp4' : 'video/webm';
+    const blob = new Blob([target.buffer], { type: mimeType });
+    const url = URL.createObjectURL(blob);
+    report(totalFrames, 'Video pronto!', true);
+    return { blob, url, format: plan.container, mimeType };
+  }
+
+  private async exportRealtime(
+    config: VisualizerConfig,
+    settings: ExportSettings,
+    startOffsetSeconds: number,
+    onProgress: (progress: ExportProgress) => void
+  ): Promise<ExportResult> {
     const buffer = audioEngine.getAudioBuffer();
     if (!buffer) throw new Error('Nessun audio caricato. Carica un brano prima di esportare.');
     if (typeof MediaRecorder === 'undefined') {
