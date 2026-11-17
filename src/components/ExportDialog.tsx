@@ -1,7 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { X, Download, AlertTriangle, CheckCircle2, Film, Loader2, RotateCcw, Info } from 'lucide-react';
 import { ExportProgress, ExportSettings, ExportResolution, RESOLUTION_SIZES, VisualizerConfig } from '../types/visualizer';
-import { videoExporter, detectSupportedVideoFormats, getExportDuration } from '../visualizer/videoExporter';
+import { videoExporter, detectSupportedVideoFormats, getExportDuration, planEncoding, EncoderPlan } from '../visualizer/videoExporter';
 import { audioEngine } from '../audio/audioEngine';
 import { Button, Segmented, Slider, Toggle, FieldLabel, cx } from '../ui/controls';
 import { formatTime } from './Transport';
@@ -32,6 +32,7 @@ export const ExportDialog: React.FC<ExportDialogProps> = ({ open, onClose, confi
   const [result, setResult] = useState<{ url: string; size: number; filename: string; format: string } | null>(null);
   const [error, setError] = useState<string | null>(null);
   const resultUrl = useRef<string | null>(null);
+  const [plan, setPlan] = useState<EncoderPlan | null>(null);
 
   const support = useMemo(() => detectSupportedVideoFormats(settings.resolution === '4k'), [settings.resolution]);
   const buffer = audioEngine.getAudioBuffer();
@@ -41,6 +42,17 @@ export const ExportDialog: React.FC<ExportDialogProps> = ({ open, onClose, confi
   const estMB = (duration * (settings.bitrateMbps + 0.25)) / 8;
 
   const up = (patch: Partial<ExportSettings>) => onChangeSettings({ ...settings, ...patch });
+  const offline = plan?.mode === 'offline';
+
+  // Probe which encoders this browser really supports for the chosen settings
+  useEffect(() => {
+    if (!open) return;
+    let alive = true;
+    planEncoding(settings).then((p) => alive && setPlan(p));
+    return () => {
+      alive = false;
+    };
+  }, [open, settings]);
 
   // Abort a running export if the dialog closes; free the previous video blob
   useEffect(() => {
@@ -107,7 +119,9 @@ export const ExportDialog: React.FC<ExportDialogProps> = ({ open, onClose, confi
           </span>
           <div className="flex-1">
             <h2 id="export-title" className="text-sm font-semibold">Esporta video</h2>
-            <p className="text-[11px] text-faint">Registrazione in tempo reale con audio sincronizzato</p>
+            <p className="text-[11px] text-faint">
+              {offline ? 'Rendering fotogramma per fotogramma: video sempre fluido' : 'Registrazione in tempo reale con audio sincronizzato'}
+            </p>
           </div>
           <button onClick={onClose} disabled={busy} className="w-8 h-8 rounded-lg flex items-center justify-center text-dim hover:text-fg hover:bg-hover disabled:opacity-30" aria-label="Chiudi">
             <X className="w-4 h-4" />
@@ -153,11 +167,13 @@ export const ExportDialog: React.FC<ExportDialogProps> = ({ open, onClose, confi
               <span className="text-center">
                 Frame {progress.currentFrame}/{progress.totalFrames}
               </span>
-              <span className="text-right">Restano ~{Math.ceil(progress.etaSeconds)}s</span>
+              <span className="text-right">Restano ~{formatTime(progress.etaSeconds).replace(/\.\d$/, '')}</span>
             </div>
             <div className="flex items-start gap-2 p-3 rounded-lg bg-raised border border-line text-[11px] text-dim">
               <Info className="w-3.5 h-3.5 shrink-0 mt-0.5" />
-              La registrazione avviene in tempo reale: tieni questa scheda aperta e in primo piano per il risultato più fluido.
+              {offline
+                ? 'Ogni fotogramma viene disegnato e codificato singolarmente: anche se il computer rallenta, il video finale resta fluido. Puoi continuare a usare il PC.'
+                : 'Questo browser non supporta WebCodecs: la registrazione avviene in tempo reale. Tieni la scheda in primo piano e chiudi altre app pesanti per evitare scatti (meglio Chrome o Edge aggiornati).'}
             </div>
             <Button variant="danger" className="w-full" onClick={() => videoExporter.cancel()}>
               Annulla esportazione
@@ -219,7 +235,19 @@ export const ExportDialog: React.FC<ExportDialogProps> = ({ open, onClose, confi
               />
             </div>
 
-            {settings.format === 'mp4' && !support.mp4Supported && (
+            {plan && offline && settings.format === 'mp4' && plan.container === 'webm' && (
+              <div className="flex items-start gap-2 p-3 rounded-lg bg-raised border border-line text-[11px] text-dim">
+                <Info className="w-3.5 h-3.5 shrink-0 mt-0.5 text-acid" />
+                Questo browser non può codificare H.264 a questa risoluzione: il video verrà salvato in WebM ({plan.videoCodec?.toUpperCase()}), compatibile con YouTube, Premiere, DaVinci e VLC.
+              </div>
+            )}
+            {plan && offline && plan.container === 'mp4' && plan.audioCodec === 'opus' && (
+              <div className="flex items-start gap-2 p-3 rounded-lg bg-raised border border-line text-[11px] text-dim">
+                <Info className="w-3.5 h-3.5 shrink-0 mt-0.5 text-acid" />
+                Il sistema non offre l'encoder AAC: l'audio dell'MP4 sarà in Opus (funziona su YouTube, Chrome, VLC, Premiere; QuickTime potrebbe non riprodurlo). Su Windows e macOS di solito viene usato AAC.
+              </div>
+            )}
+            {plan && !offline && settings.format === 'mp4' && !support.mp4Supported && (
               <div className="flex items-start gap-2 p-3 rounded-lg bg-raised border border-line text-[11px] text-dim">
                 <Info className="w-3.5 h-3.5 shrink-0 mt-0.5 text-acid" />
                 Questo browser non può registrare MP4: il video verrà salvato in WebM (compatibile con YouTube, Premiere, DaVinci e VLC). Per MP4 nativo usa Chrome o Edge aggiornati.
@@ -263,7 +291,7 @@ export const ExportDialog: React.FC<ExportDialogProps> = ({ open, onClose, confi
               {[
                 ['Durata video', formatTime(duration)],
                 ['Dimensione stimata', `~${estMB.toFixed(0)} MB`],
-                ['Tempo richiesto', `~${Math.ceil(duration)}s`],
+                [offline ? 'Codec' : 'Tempo richiesto', offline ? `${plan?.videoCodec?.toUpperCase()} + ${plan?.audioCodec?.toUpperCase()}` : `~${Math.ceil(duration)}s`],
               ].map(([k, v]) => (
                 <div key={k} className="bg-panel px-3 py-2.5">
                   <div className="text-[10px] uppercase tracking-wider text-faint">{k}</div>
@@ -277,13 +305,13 @@ export const ExportDialog: React.FC<ExportDialogProps> = ({ open, onClose, confi
                 <AlertTriangle className="w-4 h-4 shrink-0" /> {error}
               </div>
             )}
-            {!support.recorderAvailable && (
+            {plan && !offline && !support.recorderAvailable && (
               <div className="flex items-start gap-2 p-3 rounded-lg border border-danger/40 bg-danger/10 text-xs text-danger">
                 <AlertTriangle className="w-4 h-4 shrink-0" /> Il browser non supporta la registrazione video (MediaRecorder).
               </div>
             )}
 
-            <Button variant="primary" size="lg" className="w-full" disabled={!buffer || duration < 0.5 || !support.recorderAvailable} onClick={begin}>
+            <Button variant="primary" size="lg" className="w-full" disabled={!buffer || duration < 0.5 || !plan || (!offline && !support.recorderAvailable)} onClick={begin}>
               <Film className="w-4 h-4" /> Avvia rendering
             </Button>
           </div>

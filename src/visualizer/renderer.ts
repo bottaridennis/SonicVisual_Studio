@@ -120,10 +120,12 @@ export class VisualizerRenderer {
 
   // Offscreen buffers
   private layer: HTMLCanvasElement | null = null;
-  private tint: HTMLCanvasElement | null = null;
   private bgCache: { key: string; canvas: HTMLCanvasElement } | null = null;
   private grain: HTMLCanvasElement | null = null;
   private sprites = new Map<string, HTMLCanvasElement>();
+
+  /** Draw calls (images) that must sit above the bloom so they keep their contrast. */
+  private deferred: ((ctx: Ctx) => void)[] = [];
 
   /** Text layer bounding boxes from the last rendered frame (for hit-testing & gizmos). */
   public lastTextBounds: TextBounds[] = [];
@@ -252,32 +254,92 @@ export class VisualizerRenderer {
 
     this.renderRings(lctx, config, width, height, pal, u, k);
     this.renderParticles(lctx, width, height, config, analysis, pal, u, dt, k);
+    this.deferred.length = 0;
     this.renderByLayout(lctx, width, height, config, analysis, pal, u, dt);
     lctx.setTransform(1, 0, 0, 1, 0, 0);
 
+    // Glow and chromatic fringes are computed on a quarter-resolution copy of the layer:
+    // far cheaper than per-shape shadowBlur, and resolution independent.
+    const sw = Math.max(1, Math.ceil(width / 4));
+    const sh = Math.max(1, Math.ceil(height / 4));
     const chroma = (config.chromaticAberration || 0) * Math.max(0, this.bassSmooth - 0.25) * 1.6;
-    if (chroma > 0.02) {
-      const off = chroma * 14 * u;
-      const tint = this.ensureTint(width, height);
+    const wantGlow = config.glowIntensity > 0;
+    let small: HTMLCanvasElement | null = null;
+    if (wantGlow || chroma > 0.02) {
+      small = this.ensureScratch('small', sw, sh);
+      const sctx = small.getContext('2d')!;
+      sctx.clearRect(0, 0, sw, sh);
+      sctx.drawImage(layer, 0, 0, sw, sh);
+    }
+
+    if (small && chroma > 0.02) {
+      const off = (chroma * 14 * u) / 4; // in quarter-res pixels
+      const fringe = this.ensureScratch('fringe', sw, sh);
+      const fctx = fringe.getContext('2d')!;
+      const tint = this.ensureScratch('tint', sw, sh);
       const tctx = tint.getContext('2d')!;
-      ctx.save();
-      ctx.globalCompositeOperation = 'lighter';
-      ctx.globalAlpha = Math.min(0.55, chroma);
+      fctx.globalCompositeOperation = 'source-over';
+      fctx.clearRect(0, 0, sw, sh);
       for (const [color, dx] of [
         ['#ff2a55', -off],
         ['#22e1ff', off],
       ] as const) {
         tctx.globalCompositeOperation = 'source-over';
-        tctx.clearRect(0, 0, width, height);
-        tctx.drawImage(layer, 0, 0);
+        tctx.clearRect(0, 0, sw, sh);
+        tctx.drawImage(small, dx, 0);
         tctx.globalCompositeOperation = 'source-in';
         tctx.fillStyle = color;
-        tctx.fillRect(0, 0, width, height);
-        ctx.drawImage(tint, dx, 0);
+        tctx.fillRect(0, 0, sw, sh);
+        fctx.globalCompositeOperation = 'lighter';
+        fctx.drawImage(tint, 0, 0);
       }
+      ctx.save();
+      ctx.globalCompositeOperation = 'lighter';
+      ctx.globalAlpha = Math.min(0.55, chroma);
+      ctx.drawImage(fringe, 0, 0, width, height);
       ctx.restore();
     }
+
     ctx.drawImage(layer, 0, 0);
+
+    if (small && wantGlow) {
+      const bloom = this.ensureScratch('bloom', sw, sh);
+      const bctx = bloom.getContext('2d')!;
+      bctx.globalCompositeOperation = 'source-over';
+      bctx.clearRect(0, 0, sw, sh);
+      const radius = Math.max(1, config.glowIntensity * u * 0.32);
+      if (this.canvasFilter(bctx)) {
+        bctx.filter = `blur(${radius.toFixed(1)}px)`;
+        bctx.drawImage(small, 0, 0);
+        bctx.filter = 'none';
+      } else {
+        // No canvas filter (older Safari): blur by down/up-sampling
+        const tiny = this.ensureScratch('tiny', Math.max(1, Math.ceil(sw / 4)), Math.max(1, Math.ceil(sh / 4)));
+        const tctx = tiny.getContext('2d')!;
+        tctx.clearRect(0, 0, tiny.width, tiny.height);
+        tctx.drawImage(small, 0, 0, tiny.width, tiny.height);
+        bctx.drawImage(tiny, 0, 0, sw, sh);
+      }
+      // Tint the halo towards the glow colour
+      bctx.globalCompositeOperation = 'source-atop';
+      bctx.fillStyle = withAlpha(pal.glow, 0.5);
+      bctx.fillRect(0, 0, sw, sh);
+      ctx.save();
+      ctx.globalCompositeOperation = 'lighter';
+      ctx.globalAlpha = Math.min(1.2, config.glowIntensity / 20) * 0.75;
+      ctx.drawImage(bloom, 0, 0, width, height);
+      ctx.restore();
+    }
+
+    // Images drawn again on top of the bloom, with the same camera transform
+    if (this.deferred.length) {
+      ctx.save();
+      ctx.translate(cx + this.shakeX, cy + this.shakeY);
+      ctx.scale(this.zoom, this.zoom);
+      ctx.translate(-cx, -cy);
+      for (const draw of this.deferred) draw(ctx);
+      ctx.restore();
+    }
 
     // ---- 3. beat flash
     if (this.flash > 0.01) {
@@ -316,9 +378,24 @@ export class VisualizerRenderer {
     return this.layer;
   }
 
-  private ensureTint(w: number, h: number) {
-    if (!this.tint || this.tint.width !== w || this.tint.height !== h) this.tint = makeCanvas(w, h);
-    return this.tint;
+  private scratch = new Map<string, HTMLCanvasElement>();
+  private ensureScratch(name: string, w: number, h: number) {
+    let c = this.scratch.get(name);
+    if (!c || c.width !== w || c.height !== h) {
+      c = makeCanvas(w, h);
+      this.scratch.set(name, c);
+    }
+    return c;
+  }
+
+  private filterSupport: boolean | null = null;
+  private canvasFilter(ctx: Ctx): boolean {
+    if (this.filterSupport === null) {
+      ctx.filter = 'blur(1px)';
+      this.filterSupport = ctx.filter === 'blur(1px)';
+      ctx.filter = 'none';
+    }
+    return this.filterSupport;
   }
 
   /** Soft radial sprite used for glowing particles (much cheaper than shadowBlur). */
@@ -403,28 +480,43 @@ export class VisualizerRenderer {
     return values[Math.min(values.length - 1, Math.floor((idx / half) * values.length))];
   }
 
-  private applyGlow(ctx: Ctx, config: VisualizerConfig, color: string, u: number, mult = 1) {
-    if (config.glowIntensity > 0) {
-      ctx.shadowBlur = config.glowIntensity * u * 1.4 * mult;
-      ctx.shadowColor = color;
-    } else {
-      ctx.shadowBlur = 0;
-    }
+  /**
+   * Glow is applied once per frame as a bloom post-process (see renderFrame), which is
+   * much cheaper than per-shape shadowBlur. Shapes are drawn without shadows.
+   */
+  private applyGlow(ctx: Ctx, _config: VisualizerConfig, _color: string, _u: number, _mult = 1) {
+    ctx.shadowBlur = 0;
   }
 
   // ------------------------------------------------------------------ background
 
+  /**
+   * The background (image or gradient, blur, dimming and vignette) only changes when the settings change,
+   * so it is baked into one cached canvas and drawn with a single drawImage per frame.
+   */
   private renderBackground(ctx: Ctx, width: number, height: number, config: VisualizerConfig, u: number) {
     const img = this.getImage(config.backgroundUrl);
-    if (img) {
-      const margin = config.backgroundParallax ? 0.06 : 0;
-      const bw = Math.round(width * (1 + margin));
-      const bh = Math.round(height * (1 + margin));
-      const blurPx = (config.backgroundBlur || 0) * u * 0.9;
-      const key = `${config.backgroundUrl.length}|${config.backgroundUrl.slice(-48)}|${bw}x${bh}|${blurPx.toFixed(1)}`;
-      if (!this.bgCache || this.bgCache.key !== key) {
-        const c = makeCanvas(bw, bh);
-        const cctx = c.getContext('2d')!;
+    const margin = img && config.backgroundParallax ? 0.06 : 0;
+    const bw = Math.round(width * (1 + margin));
+    const bh = Math.round(height * (1 + margin));
+    const ox0 = (width - bw) / 2;
+    const oy0 = (height - bh) / 2;
+    const blurPx = (config.backgroundBlur || 0) * u * 0.9;
+    const { cx, cy } = this.center(config, width, height);
+    const key = [
+      img ? `${config.backgroundUrl.length}|${config.backgroundUrl.slice(-48)}` : 'none',
+      `${bw}x${bh}`,
+      blurPx.toFixed(1),
+      config.backgroundDim.toFixed(3),
+      config.backgroundVignette.toFixed(3),
+      Math.round(cx),
+      Math.round(cy),
+    ].join('|');
+
+    if (!this.bgCache || this.bgCache.key !== key) {
+      const c = makeCanvas(bw, bh);
+      const cctx = c.getContext('2d', { alpha: false })!;
+      if (img) {
         if (blurPx > 0) {
           // draw slightly larger to hide blurred transparent edges
           const pad = blurPx * 2.5;
@@ -434,44 +526,48 @@ export class VisualizerRenderer {
         } else {
           drawImageCover(cctx, img, 0, 0, bw, bh);
         }
-        this.bgCache = { key, canvas: c };
+      } else {
+        const g = cctx.createRadialGradient(bw / 2, bh * 0.45, 0, bw / 2, bh / 2, Math.max(bw, bh) * 0.8);
+        g.addColorStop(0, '#1b1530');
+        g.addColorStop(0.55, '#0b0a14');
+        g.addColorStop(1, '#030305');
+        cctx.fillStyle = g;
+        cctx.fillRect(0, 0, bw, bh);
       }
-      let ox = (width - bw) / 2;
-      let oy = (height - bh) / 2;
-      if (config.backgroundParallax) {
-        ox += Math.sin(this.timeSec * 0.13) * width * margin * 0.35 - this.shakeX * 0.3;
-        oy += Math.cos(this.timeSec * 0.11) * height * margin * 0.35 - this.shakeY * 0.3;
+      if (config.backgroundDim > 0) {
+        cctx.fillStyle = `rgba(0,0,0,${Math.min(0.95, config.backgroundDim)})`;
+        cctx.fillRect(0, 0, bw, bh);
       }
-      const z = 1 + (this.zoom - 1) * 0.4;
+      if (config.backgroundVignette > 0) {
+        const vx = cx - ox0;
+        const vy = cy - oy0;
+        const radius = Math.hypot(width, height) * 0.6;
+        const v = cctx.createRadialGradient(vx, vy, radius * 0.25, vx, vy, radius);
+        v.addColorStop(0, 'rgba(0,0,0,0)');
+        v.addColorStop(0.65, `rgba(0,0,0,${config.backgroundVignette * 0.45})`);
+        v.addColorStop(1, `rgba(0,0,0,${Math.min(1, config.backgroundVignette * 1.05)})`);
+        cctx.fillStyle = v;
+        cctx.fillRect(0, 0, bw, bh);
+      }
+      this.bgCache = { key, canvas: c };
+    }
+
+    let ox = ox0;
+    let oy = oy0;
+    if (margin) {
+      ox += Math.sin(this.timeSec * 0.13) * width * margin * 0.35 - this.shakeX * 0.3;
+      oy += Math.cos(this.timeSec * 0.11) * height * margin * 0.35 - this.shakeY * 0.3;
+    }
+    const z = 1 + (this.zoom - 1) * 0.4;
+    if (Math.abs(z - 1) < 0.001) {
+      ctx.drawImage(this.bgCache.canvas, ox, oy);
+    } else {
       ctx.save();
       ctx.translate(width / 2, height / 2);
       ctx.scale(z, z);
       ctx.translate(-width / 2, -height / 2);
       ctx.drawImage(this.bgCache.canvas, ox, oy);
       ctx.restore();
-    } else {
-      const g = ctx.createRadialGradient(width / 2, height * 0.45, 0, width / 2, height / 2, Math.max(width, height) * 0.8);
-      g.addColorStop(0, '#1b1530');
-      g.addColorStop(0.55, '#0b0a14');
-      g.addColorStop(1, '#030305');
-      ctx.fillStyle = g;
-      ctx.fillRect(0, 0, width, height);
-    }
-
-    if (config.backgroundDim > 0) {
-      ctx.fillStyle = `rgba(0,0,0,${Math.min(0.95, config.backgroundDim)})`;
-      ctx.fillRect(0, 0, width, height);
-    }
-
-    if (config.backgroundVignette > 0) {
-      const { cx, cy } = this.center(config, width, height);
-      const radius = Math.hypot(width, height) * 0.6;
-      const v = ctx.createRadialGradient(cx, cy, radius * 0.25, cx, cy, radius);
-      v.addColorStop(0, 'rgba(0,0,0,0)');
-      v.addColorStop(0.65, `rgba(0,0,0,${config.backgroundVignette * 0.45})`);
-      v.addColorStop(1, `rgba(0,0,0,${Math.min(1, config.backgroundVignette * 1.05)})`);
-      ctx.fillStyle = v;
-      ctx.fillRect(0, 0, width, height);
     }
   }
 
@@ -481,10 +577,11 @@ export class VisualizerRenderer {
       this.grain = makeCanvas(size, size);
       const g = this.grain.getContext('2d')!;
       const img = g.createImageData(size, size);
+      // Light and dark specks with alpha, so a plain source-over blend works (much cheaper than 'overlay')
       for (let i = 0; i < img.data.length; i += 4) {
-        const v = Math.random() * 255;
-        img.data[i] = img.data[i + 1] = img.data[i + 2] = v;
-        img.data[i + 3] = 255;
+        const v = Math.random() * 2 - 1;
+        img.data[i] = img.data[i + 1] = img.data[i + 2] = v > 0 ? 255 : 0;
+        img.data[i + 3] = Math.round(Math.abs(v) * 255);
       }
       g.putImageData(img, 0, 0);
     }
@@ -495,8 +592,7 @@ export class VisualizerRenderer {
     const oy = Math.random() * 200;
     pattern.setTransform(new DOMMatrix([scale, 0, 0, scale, ox, oy]));
     ctx.save();
-    ctx.globalCompositeOperation = 'overlay';
-    ctx.globalAlpha = Math.min(0.5, amount * 0.35);
+    ctx.globalAlpha = Math.min(0.35, amount * 0.22);
     ctx.fillStyle = pattern;
     ctx.fillRect(0, 0, width, height);
     ctx.restore();
@@ -835,7 +931,9 @@ export class VisualizerRenderer {
     }
     ctx.restore();
 
-    this.renderLogo(ctx, cx, cy, radius, config, pal, scaleU, dt);
+    if (config.logoSpin) this.logoAngle += dt * 0.6;
+    this.renderLogo(ctx, cx, cy, radius, config, pal, scaleU);
+    if (config.glowIntensity > 0) this.deferred.push((c) => this.renderLogo(c, cx, cy, radius, config, pal, scaleU));
   }
 
   private renderLogo(
@@ -845,10 +943,8 @@ export class VisualizerRenderer {
     radius: number,
     config: VisualizerConfig,
     pal: Palette,
-    scaleU: number,
-    dt: number
+    scaleU: number
   ) {
-    if (config.logoSpin) this.logoAngle += dt * 0.6;
     const img = this.getImage(config.logoUrl);
     const shape = config.logoShape;
     const pathFor = (r: number) => {
@@ -1283,113 +1379,117 @@ export class VisualizerRenderer {
     ctx.stroke();
     ctx.restore();
 
-    // Record body
-    ctx.save();
-    ctx.shadowBlur = 50 * s;
-    ctx.shadowColor = 'rgba(0,0,0,0.9)';
-    ctx.shadowOffsetY = 12 * s;
-    ctx.beginPath();
-    ctx.arc(cx, cy, R, 0, Math.PI * 2);
-    const body = ctx.createRadialGradient(cx, cy, R * 0.3, cx, cy, R);
-    body.addColorStop(0, '#16161c');
-    body.addColorStop(1, '#0a0a0e');
-    ctx.fillStyle = body;
-    ctx.fill();
-    ctx.restore();
-
-    // Grooves
-    ctx.save();
-    ctx.lineWidth = Math.max(0.5, 1 * s);
-    let idx = 0;
-    for (let r = R * 0.42; r < R * 0.97; r += Math.max(2, 4.5 * s)) {
-      ctx.strokeStyle = idx++ % 3 === 0 ? 'rgba(255,255,255,0.055)' : 'rgba(0,0,0,0.5)';
+    const drawRecord = (ctx: Ctx) => {
+      // Record body
+      ctx.save();
+      ctx.shadowBlur = 50 * s;
+      ctx.shadowColor = 'rgba(0,0,0,0.9)';
+      ctx.shadowOffsetY = 12 * s;
       ctx.beginPath();
-      ctx.arc(cx, cy, r, 0, Math.PI * 2);
-      ctx.stroke();
-    }
-    // Rotating light sheen (two opposite cones)
-    ctx.translate(cx, cy);
-    ctx.rotate(this.vinylAngle * 0.15);
-    for (const base of [0, Math.PI]) {
-      const g = ctx.createConicGradient ? ctx.createConicGradient(base, 0, 0) : null;
-      if (g) {
-        g.addColorStop(0, 'rgba(255,255,255,0)');
-        g.addColorStop(0.06, 'rgba(255,255,255,0.10)');
-        g.addColorStop(0.12, 'rgba(255,255,255,0)');
-        g.addColorStop(1, 'rgba(255,255,255,0)');
-        ctx.fillStyle = g;
+      ctx.arc(cx, cy, R, 0, Math.PI * 2);
+      const body = ctx.createRadialGradient(cx, cy, R * 0.3, cx, cy, R);
+      body.addColorStop(0, '#16161c');
+      body.addColorStop(1, '#0a0a0e');
+      ctx.fillStyle = body;
+      ctx.fill();
+      ctx.restore();
+
+      // Grooves
+      ctx.save();
+      ctx.lineWidth = Math.max(0.5, 1 * s);
+      let idx = 0;
+      for (let r = R * 0.42; r < R * 0.97; r += Math.max(2, 4.5 * s)) {
+        ctx.strokeStyle = idx++ % 3 === 0 ? 'rgba(255,255,255,0.055)' : 'rgba(0,0,0,0.5)';
         ctx.beginPath();
-        ctx.arc(0, 0, R * 0.97, 0, Math.PI * 2);
-        ctx.arc(0, 0, R * 0.4, 0, Math.PI * 2, true);
-        ctx.fill();
+        ctx.arc(cx, cy, r, 0, Math.PI * 2);
+        ctx.stroke();
       }
-    }
-    ctx.restore();
-
-    // Label (rotating)
-    const labelR = R * 0.36;
-    ctx.save();
-    ctx.translate(cx, cy);
-    ctx.rotate(this.vinylAngle);
-    ctx.beginPath();
-    ctx.arc(0, 0, labelR, 0, Math.PI * 2);
-    const lg = ctx.createLinearGradient(-labelR, -labelR, labelR, labelR);
-    lg.addColorStop(0, pal.primary);
-    lg.addColorStop(1, pal.secondary);
-    ctx.fillStyle = lg;
-    ctx.fill();
-    const img = this.getImage(config.logoUrl);
-    if (img) {
-      ctx.save();
-      ctx.beginPath();
-      ctx.arc(0, 0, labelR * 0.92, 0, Math.PI * 2);
-      ctx.clip();
-      drawImageCover(ctx, img, -labelR, -labelR, labelR * 2, labelR * 2);
+      // Rotating light sheen (two opposite cones)
+      ctx.translate(cx, cy);
+      ctx.rotate(this.vinylAngle * 0.15);
+      for (const base of [0, Math.PI]) {
+        const g = ctx.createConicGradient ? ctx.createConicGradient(base, 0, 0) : null;
+        if (g) {
+          g.addColorStop(0, 'rgba(255,255,255,0)');
+          g.addColorStop(0.06, 'rgba(255,255,255,0.10)');
+          g.addColorStop(0.12, 'rgba(255,255,255,0)');
+          g.addColorStop(1, 'rgba(255,255,255,0)');
+          ctx.fillStyle = g;
+          ctx.beginPath();
+          ctx.arc(0, 0, R * 0.97, 0, Math.PI * 2);
+          ctx.arc(0, 0, R * 0.4, 0, Math.PI * 2, true);
+          ctx.fill();
+        }
+      }
       ctx.restore();
-    }
-    ctx.beginPath();
-    ctx.arc(0, 0, labelR * 0.08, 0, Math.PI * 2);
-    ctx.fillStyle = '#d4d4d8';
-    ctx.fill();
-    ctx.restore();
 
-    // Rim glow
-    if (config.turntableGrooveGlow) {
+      // Label (rotating)
+      const labelR = R * 0.36;
       ctx.save();
-      this.applyGlow(ctx, config, pal.glow, s, 1.4);
-      ctx.strokeStyle = withAlpha(pal.glow, 0.6 + this.bassSmooth * 0.4);
-      ctx.lineWidth = Math.max(1, (2 + this.bassSmooth * 5) * s);
+      ctx.translate(cx, cy);
+      ctx.rotate(this.vinylAngle);
       ctx.beginPath();
-      ctx.arc(cx, cy, R + 2 * s, 0, Math.PI * 2);
+      ctx.arc(0, 0, labelR, 0, Math.PI * 2);
+      const lg = ctx.createLinearGradient(-labelR, -labelR, labelR, labelR);
+      lg.addColorStop(0, pal.primary);
+      lg.addColorStop(1, pal.secondary);
+      ctx.fillStyle = lg;
+      ctx.fill();
+      const img = this.getImage(config.logoUrl);
+      if (img) {
+        ctx.save();
+        ctx.beginPath();
+        ctx.arc(0, 0, labelR * 0.92, 0, Math.PI * 2);
+        ctx.clip();
+        drawImageCover(ctx, img, -labelR, -labelR, labelR * 2, labelR * 2);
+        ctx.restore();
+      }
+      ctx.beginPath();
+      ctx.arc(0, 0, labelR * 0.08, 0, Math.PI * 2);
+      ctx.fillStyle = '#d4d4d8';
+      ctx.fill();
+      ctx.restore();
+
+      // Rim glow
+      if (config.turntableGrooveGlow) {
+        ctx.save();
+        this.applyGlow(ctx, config, pal.glow, s, 1.4);
+        ctx.strokeStyle = withAlpha(pal.glow, 0.6 + this.bassSmooth * 0.4);
+        ctx.lineWidth = Math.max(1, (2 + this.bassSmooth * 5) * s);
+        ctx.beginPath();
+        ctx.arc(cx, cy, R + 2 * s, 0, Math.PI * 2);
+        ctx.stroke();
+        ctx.restore();
+      }
+
+      // Tonearm
+      ctx.save();
+      const px = cx + R * 1.08;
+      const py = cy - R * 0.92;
+      const armAngle = 2.05 + Math.sin(this.timeSec * 0.5) * 0.006;
+      ctx.translate(px, py);
+      ctx.fillStyle = '#3f3f46';
+      ctx.beginPath();
+      ctx.arc(0, 0, 26 * s, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = '#a1a1aa';
+      ctx.beginPath();
+      ctx.arc(0, 0, 12 * s, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.rotate(armAngle);
+      ctx.strokeStyle = '#d4d4d8';
+      ctx.lineWidth = Math.max(1, 7 * s);
+      ctx.lineCap = 'round';
+      ctx.beginPath();
+      ctx.moveTo(0, 0);
+      ctx.lineTo(R * 1.05, 0);
       ctx.stroke();
+      ctx.fillStyle = '#e4e4e7';
+      ctx.fillRect(R * 1.02, -12 * s, 46 * s, 24 * s);
       ctx.restore();
-    }
-
-    // Tonearm
-    ctx.save();
-    const px = cx + R * 1.08;
-    const py = cy - R * 0.92;
-    const armAngle = 2.05 + Math.sin(this.timeSec * 0.5) * 0.006;
-    ctx.translate(px, py);
-    ctx.fillStyle = '#3f3f46';
-    ctx.beginPath();
-    ctx.arc(0, 0, 26 * s, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.fillStyle = '#a1a1aa';
-    ctx.beginPath();
-    ctx.arc(0, 0, 12 * s, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.rotate(armAngle);
-    ctx.strokeStyle = '#d4d4d8';
-    ctx.lineWidth = Math.max(1, 7 * s);
-    ctx.lineCap = 'round';
-    ctx.beginPath();
-    ctx.moveTo(0, 0);
-    ctx.lineTo(R * 1.05, 0);
-    ctx.stroke();
-    ctx.fillStyle = '#e4e4e7';
-    ctx.fillRect(R * 1.02, -12 * s, 46 * s, 24 * s);
-    ctx.restore();
+    };
+    drawRecord(ctx);
+    if (config.glowIntensity > 0) this.deferred.push(drawRecord);
   }
 
   // 8. Album art pulse ---------------------------------------------------------------
@@ -1409,34 +1509,37 @@ export class VisualizerRenderer {
     const y = cy - size / 2;
     const r = size * 0.05;
 
-    ctx.save();
-    // Glow + drop shadow
-    ctx.shadowBlur = (40 + this.bassSmooth * 40) * s;
-    ctx.shadowColor = withAlpha(pal.glow, 0.85);
-    ctx.fillStyle = '#0b0b10';
-    ctx.beginPath();
-    ctx.roundRect(x, y, size, size, r);
-    ctx.fill();
-    ctx.shadowBlur = 0;
+    const drawCover = (ctx: Ctx) => {
+      ctx.save();
+      ctx.fillStyle = '#0b0b10';
+      ctx.beginPath();
+      ctx.roundRect(x, y, size, size, r);
+      ctx.fill();
+      ctx.shadowBlur = 0;
+
+      ctx.save();
+      ctx.clip();
+      const img = this.getImage(config.logoUrl);
+      if (img) drawImageCover(ctx, img, x, y, size, size);
+      const sheen = ctx.createLinearGradient(x, y, x + size, y + size);
+      sheen.addColorStop(0, 'rgba(255,255,255,0.14)');
+      sheen.addColorStop(0.45, 'rgba(255,255,255,0)');
+      sheen.addColorStop(1, 'rgba(0,0,0,0.25)');
+      ctx.fillStyle = sheen;
+      ctx.fillRect(x, y, size, size);
+      ctx.restore();
+
+      ctx.strokeStyle = withAlpha(pal.primary, 0.8);
+      ctx.lineWidth = Math.max(1, 2.5 * s);
+      ctx.beginPath();
+      ctx.roundRect(x, y, size, size, r);
+      ctx.stroke();
+      ctx.restore();
+    };
+    drawCover(ctx);
+    if (config.glowIntensity > 0) this.deferred.push(drawCover);
 
     ctx.save();
-    ctx.clip();
-    const img = this.getImage(config.logoUrl);
-    if (img) drawImageCover(ctx, img, x, y, size, size);
-    const sheen = ctx.createLinearGradient(x, y, x + size, y + size);
-    sheen.addColorStop(0, 'rgba(255,255,255,0.14)');
-    sheen.addColorStop(0.45, 'rgba(255,255,255,0)');
-    sheen.addColorStop(1, 'rgba(0,0,0,0.25)');
-    ctx.fillStyle = sheen;
-    ctx.fillRect(x, y, size, size);
-    ctx.restore();
-
-    ctx.strokeStyle = withAlpha(pal.primary, 0.8);
-    ctx.lineWidth = Math.max(1, 2.5 * s);
-    ctx.beginPath();
-    ctx.roundRect(x, y, size, size, r);
-    ctx.stroke();
-
     // Spectrum strip beneath the cover
     const count = 48;
     const spec = this.spectrum(count / 2, analysis, config.smoothing);

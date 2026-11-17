@@ -44,8 +44,9 @@ Audio e immagini restano sul tuo computer: nessun file viene caricato su server.
 **Export video**
 - 720p, 1080p, 4K, quadrato 1:1 e verticale 9:16 (Reels/TikTok/Shorts). L'anteprima assume le proporzioni scelte.
 - 30 o 60 fps, bitrate regolabile, durata intera / 15s / 30s / 60s / personalizzata, partenza dall'inizio o dalla testina.
-- MP4 (H.264) quando il browser lo supporta, altrimenti WebM (VP9).
-- Ogni frame è disegnato seguendo il clock dell'audio, quindi immagine e suono restano sincronizzati.
+- MP4 (H.264 + AAC, oppure Opus dove AAC non è disponibile) quando il browser lo supporta, altrimenti WebM (VP9 + Opus).
+- **Rendering offline fotogramma per fotogramma** con WebCodecs: ogni frame viene disegnato e codificato con il suo timestamp esatto, quindi il video è perfettamente fluido anche su computer lenti (l'export può solo richiedere più tempo). L'analisi audio viene ricalcolata dal file, identica a quella dell'anteprima.
+- Nei browser senza WebCodecs si usa come ripiego la registrazione in tempo reale (MediaRecorder).
 
 ### Scorciatoie da tastiera
 
@@ -93,7 +94,7 @@ src/
 
 ## Stack
 
-React 19 · TypeScript · Vite 8 · Tailwind CSS 4 · Web Audio API · Canvas 2D · MediaRecorder · Lucide
+React 19 · TypeScript · Vite 8 · Tailwind CSS 4 · Web Audio API · Canvas 2D · WebCodecs + Mediabunny · Lucide
 
 ## Licenza
 
